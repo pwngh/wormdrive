@@ -1,0 +1,6 @@
+.DS_Store
+/node_modules
+/dist
+Makefile
+# Self-hosted webfonts are fetched on demand (scripts/fetch-fonts.mjs), not vendored.
+/public/fonts/

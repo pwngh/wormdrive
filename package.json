@@ -1,0 +1,45 @@
+{
+  "name": "wormdrive",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Peer-to-peer file shares that vanish. Wormhole-style transfer with a Drive-style browser.",
+  "author": "Preston Neal",
+  "license": "MIT",
+  "repository": "git+https://github.com/pwn-interests/wormdrive.git",
+  "homepage": "https://wormdrive.app",
+  "keywords": [
+    "webrtc",
+    "peer-to-peer",
+    "file-transfer",
+    "end-to-end-encrypted",
+    "ephemeral",
+    "data-channel"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "fetch-fonts": "node scripts/fetch-fonts.mjs",
+    "predev": "node scripts/fetch-fonts.mjs",
+    "dev": "node scripts/dev.mjs",
+    "typecheck": "tsc --noEmit",
+    "prebuild": "node scripts/fetch-fonts.mjs",
+    "build": "tsc --noEmit && vite build",
+    "start": "node server/signaling.mjs",
+    "preview": "vite preview",
+    "test": "node scripts/smoke-signaling.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "highlight.js": "^11.10.0",
+    "mammoth": "^1.8.0",
+    "pdfjs-dist": "^4.8.69",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0",
+    "xlsx": "^0.18.5"
+  }
+}

@@ -1,0 +1,113 @@
+#!/bin/sh
+# wormdrive configure — capture deployment parameters, generate Makefile.
+# Hand-rolled POSIX sh; no autotools. Re-run any time to change settings.
+set -eu
+
+DOMAIN=wormdrive.app
+PORT=8787
+APP_DIR=/opt/wormdrive
+HOST=
+
+usage() {
+	cat <<USAGE
+usage: ./configure [options]
+
+  --host USER@ADDR   deploy target over ssh (default: root@\$DOMAIN;
+                     use the raw IP for first provision, before DNS exists)
+  --domain NAME      public domain            (default: $DOMAIN)
+  --port N           app port behind Caddy    (default: $PORT)
+  --app-dir PATH     install dir on the host  (default: $APP_DIR)
+  --help             this text
+
+Writes ./Makefile from Makefile.in. Then: make provision (once), make deploy.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+	case $1 in
+		--host)      HOST=$2;        shift 2 ;;
+		--host=*)    HOST=${1#*=};   shift ;;
+		--domain)    DOMAIN=$2;      shift 2 ;;
+		--domain=*)  DOMAIN=${1#*=}; shift ;;
+		--port)      PORT=$2;        shift 2 ;;
+		--port=*)    PORT=${1#*=};   shift ;;
+		--app-dir)   APP_DIR=$2;     shift 2 ;;
+		--app-dir=*) APP_DIR=${1#*=}; shift ;;
+		--help|-h)   usage; exit 0 ;;
+		*) printf 'configure: unknown option: %s\n' "$1" >&2; usage >&2; exit 1 ;;
+	esac
+done
+
+[ -n "$HOST" ] || HOST=root@$DOMAIN
+
+# --- input validation --------------------------------------------------------
+# These values land in sed replacements, Makefile variables, and remote sh
+# command lines. Restrict to characters that are inert in all three contexts
+# rather than trying to escape for each.
+die() { printf 'configure: %s\n' "$1" >&2; exit 1; }
+
+case $DOMAIN in
+	''|*[!A-Za-z0-9.-]*) die "invalid --domain '$DOMAIN' (allowed: A-Z a-z 0-9 . -)" ;;
+esac
+case $PORT in
+	''|*[!0-9]*) die "invalid --port '$PORT' (digits only)" ;;
+esac
+[ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "--port out of range 1-65535"
+case $APP_DIR in
+	/*) ;;
+	*) die "--app-dir must be an absolute path" ;;
+esac
+case $APP_DIR in
+	*[!A-Za-z0-9._/-]*) die "invalid --app-dir '$APP_DIR' (allowed: A-Z a-z 0-9 . _ / -)" ;;
+esac
+case $HOST in
+	''|*[!A-Za-z0-9._@:-]*) die "invalid --host '$HOST' (allowed: A-Z a-z 0-9 . _ @ : -)" ;;
+esac
+
+# --- local toolchain checks --------------------------------------------------
+fail=0
+need() {
+	if command -v "$1" >/dev/null 2>&1; then
+		printf 'checking for %s... %s\n' "$1" "$(command -v "$1")"
+	else
+		printf 'checking for %s... not found\n' "$1"
+		fail=1
+	fi
+}
+need node
+need npm
+need rsync
+need ssh
+
+if command -v node >/dev/null 2>&1; then
+	major=$(node -p 'process.versions.node.split(".")[0]')
+	printf 'checking node version... %s ' "$(node --version)"
+	if [ "$major" -ge 20 ]; then printf '(ok, >=20)\n'; else printf '(too old, need >=20)\n'; fail=1; fi
+fi
+
+[ "$fail" -eq 0 ] || die "missing prerequisites above"
+
+# --- generate Makefile from Makefile.in (atomically: tmp + rename) -----------
+[ -f Makefile.in ] || die "Makefile.in not found (run from the repo root)"
+
+sed \
+	-e "s|@HOST@|$HOST|g" \
+	-e "s|@DOMAIN@|$DOMAIN|g" \
+	-e "s|@PORT@|$PORT|g" \
+	-e "s|@APP_DIR@|$APP_DIR|g" \
+	Makefile.in > Makefile.tmp
+mv Makefile.tmp Makefile
+
+cat <<SUMMARY
+
+wormdrive configured:
+
+  host:     $HOST
+  domain:   $DOMAIN
+  port:     $PORT
+  app dir:  $APP_DIR
+
+next:
+  make provision   # once, on a fresh Debian/Ubuntu box
+  make deploy      # every release
+SUMMARY

@@ -1,0 +1,89 @@
+# wormdrive — generated from Makefile.in by ./configure; edit Makefile.in.
+# POSIX make: no GNU extensions, recipes are plain sh.
+
+HOST = @HOST@
+DOMAIN = @DOMAIN@
+PORT = @PORT@
+APP_DIR = @APP_DIR@
+
+RSYNC = rsync -az
+SSH = ssh $(HOST)
+STAMP = node_modules/.make-stamp
+
+all: build
+
+help:
+	@printf 'targets:\n'
+	@printf '  build      typecheck + bundle frontend to dist/ (local)\n'
+	@printf '  check      typecheck + signaling protocol smoke tests (local)\n'
+	@printf '  provision  bootstrap a fresh Debian/Ubuntu VPS (run once)\n'
+	@printf '  deploy     build, sync, atomically swap dist, restart, healthcheck\n'
+	@printf '  rollback   swap the previous dist/ back in and restart\n'
+	@printf '  status     remote service status + health endpoint\n'
+	@printf '  logs       last 100 journal lines from the service\n'
+	@printf '  clean      remove local dist/\n'
+	@printf '  distclean  clean + remove generated Makefile\n'
+
+# Dependencies are lockfile-driven: edits to package(-lock).json trigger a
+# clean `npm ci`, so builds always reflect the pinned tree.
+$(STAMP): package.json package-lock.json
+	npm ci --no-audit --no-fund
+	touch $(STAMP)
+
+build: $(STAMP)
+	npm run build
+
+check: $(STAMP)
+	npm run typecheck
+	node scripts/smoke-signaling.mjs
+
+# Streams the provision script over ssh; nothing to copy first, nothing
+# left behind. Safe to re-run — every step is guarded or an overwrite.
+provision:
+	$(SSH) 'sh -s -- --domain $(DOMAIN) --port $(PORT) --app-dir $(APP_DIR)' \
+		< deploy/provision.sh
+
+# The 1-core box never builds and never sees devDependencies: artifacts
+# are produced here, synced to dist.staging, then swapped in with two
+# renames so the live tree is never half-updated. The displaced tree is
+# kept as dist.old for `make rollback`.
+deploy: build
+	$(RSYNC) --delete dist/ $(HOST):$(APP_DIR)/dist.staging/
+	$(RSYNC) --delete server/ $(HOST):$(APP_DIR)/server/
+	$(RSYNC) package.json package-lock.json $(HOST):$(APP_DIR)/
+	$(SSH) 'cd $(APP_DIR) \
+		&& npm ci --omit=dev --omit=optional --no-audit --no-fund \
+		&& rm -rf dist.old \
+		&& { [ ! -d dist ] || mv dist dist.old; } \
+		&& mv dist.staging dist \
+		&& chown -R wormdrive: $(APP_DIR) \
+		&& systemctl restart wormdrive'
+	@n=0; until $(SSH) 'curl -fsS http://127.0.0.1:$(PORT)/healthz' 2>/dev/null; do \
+		n=$$((n+1)); \
+		if [ $$n -ge 10 ]; then printf 'healthcheck failed after 10s\n' >&2; exit 1; fi; \
+		sleep 1; \
+	done; printf ' <- healthz; deployed to %s\n' '$(DOMAIN)'
+
+# Static rollback: restores the previous frontend bundle. Server code is
+# whatever was last synced — redeploy a known-good commit to revert that.
+rollback:
+	$(SSH) 'cd $(APP_DIR) && [ -d dist.old ] \
+		&& rm -rf dist.rb && mv dist dist.rb && mv dist.old dist && rm -rf dist.rb \
+		&& systemctl restart wormdrive'
+	@$(SSH) 'curl -fsS http://127.0.0.1:$(PORT)/healthz' \
+		&& printf ' <- healthz; rolled back\n'
+
+status:
+	$(SSH) 'systemctl status wormdrive --no-pager -l; \
+		curl -fsS http://127.0.0.1:$(PORT)/healthz && echo'
+
+logs:
+	$(SSH) 'journalctl -u wormdrive -n 100 --no-pager'
+
+clean:
+	rm -rf dist
+
+distclean: clean
+	rm -f Makefile
+
+.PHONY: all help build check provision deploy rollback status logs clean distclean
