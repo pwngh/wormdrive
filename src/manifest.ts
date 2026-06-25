@@ -1,5 +1,23 @@
-// File classification and folder-tree derivation. The wire manifest is a
-// flat list of file paths; directories are derived, never transmitted.
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
+/**
+ * File classification and folder-tree derivation. The wire manifest is a
+ * flat list of file paths; directories are derived, never transmitted.
+ *
+ * Keeping the wire format flat means the sender never has to model a tree,
+ * and the receiver reconstructs folders on demand (listDir/crumbs) from the
+ * paths alone. No directory entries on the wire also means no empty-folder or
+ * ordering ambiguity to reconcile between the two sides.
+ */
 
 import type { FileEntry, FileKind } from "./protocol";
 
@@ -25,17 +43,28 @@ const TEXT_NAMES = new Set([
   "notice", "todo", "gemfile", "rakefile", "procfile", "vagrantfile",
 ]);
 
+/** Lowercased extension after the last dot, or "" when there isn't one.
+ *  Dotfiles (`.env`), extensionless names (`Makefile`), and trailing dots all
+ *  return "" — the `dot > 0` guard follows Node's `path.extname` convention. */
 export function ext(path: string): string {
   const name = basename(path);
   const dot = name.lastIndexOf(".");
   return dot > 0 ? name.slice(dot + 1).toLowerCase() : "";
 }
 
+/** Last path segment. No trailing-slash handling — manifest paths never have one. */
 export function basename(path: string): string {
   const slash = path.lastIndexOf("/");
   return slash >= 0 ? path.slice(slash + 1) : path;
 }
 
+/** Map a path to a preview kind by extension, with a fallback for well-known
+ *  extensionless text files (Makefile, Dockerfile, LICENSE…). Unknown → "other".
+ *
+ *  The kind only drives which viewer the receiver offers; it is advisory, not a
+ *  trust boundary. Order matters where extension sets could overlap (e.g. a
+ *  format we later add to both CODE_EXT and TEXT_EXT): the first match wins, so
+ *  the more specific viewer is preferred over the generic text fallback. */
 export function classify(path: string): FileKind {
   const e = ext(path);
   if (PDF_EXT.has(e)) return "pdf";
@@ -63,6 +92,9 @@ export function toManifest(files: ReadonlyMap<string, File>): FileEntry[] {
 // Folder navigation over the flat manifest (receiver side)
 // ---------------------------------------------------------------------------
 
+/** A folder row synthesized for one listing level. `files`/`size` are rolled up
+ *  from every descendant under this directory, not just its direct children, so
+ *  the receiver can show aggregate counts without walking the tree itself. */
 export interface DirRow {
   type: "dir";
   name: string;
@@ -71,15 +103,24 @@ export interface DirRow {
   size: number;
 }
 
+/** A leaf row that carries the wire `entry` straight through, so the receiver
+ *  keeps the exact path/size/kind it was sent rather than a derived copy. */
 export interface FileRow {
   type: "file";
   name: string;
   entry: FileEntry;
 }
 
+/** Discriminated on `type` so the UI can switch on dir-vs-file without a
+ *  separate flag or instanceof. */
 export type Row = DirRow | FileRow;
 
-/** Direct children of `cwd` ("" = root). Directories first, both sorted. */
+/** Direct children of `cwd` ("" = root). Directories first, both sorted.
+ *
+ *  Single pass over the flat manifest: a path with no further slash past the
+ *  prefix is a file at this level; otherwise its first segment is a subdirectory
+ *  whose counts we accumulate. This avoids precomputing or caching a tree —
+ *  cheap enough to recompute per navigation since the manifest is in memory. */
 export function listDir(manifest: readonly FileEntry[], cwd: string): Row[] {
   const prefix = cwd === "" ? "" : `${cwd}/`;
   const dirs = new Map<string, DirRow>();
@@ -108,7 +149,10 @@ export function listDir(manifest: readonly FileEntry[], cwd: string): Row[] {
   return [...sortedDirs, ...files];
 }
 
-/** ["", "src", "src/viewers"] -> breadcrumb segments with paths. */
+/** ["", "src", "src/viewers"] -> breadcrumb segments with paths.
+ *
+ *  Always leads with a synthetic "root" crumb (path "") so the receiver can
+ *  navigate back to the top level even though "" is never a real path segment. */
 export function crumbs(cwd: string): { name: string; path: string }[] {
   const out = [{ name: "root", path: "" }];
   if (cwd === "") return out;

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="'Space Grotesk','DejaVu Sans',sans-serif">
+  <defs>
+    <radialGradient id="violet" cx="18%" cy="22%" r="65%">
+      <stop offset="0%" stop-color="#2b1e4a" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#2b1e4a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="teal" cx="88%" cy="92%" r="70%">
+      <stop offset="0%" stop-color="#0e2a3a" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#0e2a3a" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f5a524" stop-opacity="0.42"/>
+      <stop offset="62%" stop-color="#f5a524" stop-opacity="0"/>
+    </radialGradient>
+    <!-- accretion disk edge-on: hot in the middle, Doppler-bright toward the left, fading at the tips -->
+    <linearGradient id="disk" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#d98a1e" stop-opacity="0"/>
+      <stop offset="18%"  stop-color="#ffe9c2" stop-opacity="0.95"/>
+      <stop offset="50%"  stop-color="#f8b347" stop-opacity="0.92"/>
+      <stop offset="82%"  stop-color="#d98a1e" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#d98a1e" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="shadow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%"  stop-color="#04060a"/>
+      <stop offset="78%" stop-color="#05070c"/>
+      <stop offset="100%" stop-color="#0a0d13"/>
+    </radialGradient>
+    <linearGradient id="ring" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"  stop-color="#fff1d6"/>
+      <stop offset="55%" stop-color="#f5a524"/>
+      <stop offset="100%" stop-color="#c87f1c"/>
+    </linearGradient>
+    <linearGradient id="arc" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   stop-color="#f5a524" stop-opacity="0"/>
+      <stop offset="50%"  stop-color="#ffe9c2" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#f5a524" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0a0d13"/>
+  <rect width="1200" height="630" fill="url(#violet)"/>
+  <rect width="1200" height="630" fill="url(#teal)"/>
+
+  <!-- faint stars -->
+  <g fill="#e9e6db">
+    <circle cx="980" cy="90" r="1.6" opacity="0.5"/>
+    <circle cx="1090" cy="180" r="1.2" opacity="0.4"/>
+    <circle cx="150" cy="520" r="1.4" opacity="0.45"/>
+    <circle cx="1040" cy="470" r="1.1" opacity="0.35"/>
+    <circle cx="60" cy="120" r="1.2" opacity="0.4"/>
+    <circle cx="430" cy="70" r="1.0" opacity="0.3"/>
+    <circle cx="330" cy="545" r="1.1" opacity="0.3"/>
+  </g>
+
+  <!-- black hole: a lensed accretion disk wrapping a dark shadow + photon ring -->
+  <g transform="translate(255 315)">
+    <circle r="215" fill="url(#glow)"/>
+    <!-- disk seen near edge-on, poking out both sides of the shadow -->
+    <ellipse rx="205" ry="24" fill="url(#disk)"/>
+    <!-- the shadow (event horizon) -->
+    <circle r="88" fill="url(#shadow)"/>
+    <!-- the disk's far side, lensed up and over the top of the shadow -->
+    <path d="M -132 4 Q 0 -178 132 4" fill="none" stroke="url(#arc)" stroke-width="13" stroke-linecap="round"/>
+    <!-- bright photon ring hugging the shadow -->
+    <circle r="90" fill="none" stroke="url(#ring)" stroke-width="6"/>
+  </g>
+
+  <!-- wordmark + copy -->
+  <text x="500" y="296" font-size="104" font-weight="700" fill="#e9e6db" letter-spacing="-1">wormdrive</text>
+  <text x="502" y="364" font-size="40" font-weight="500" fill="#cdd3df">Peer-to-peer file shares that vanish.</text>
+  <text x="502" y="424" font-size="26" font-weight="500" fill="#8b95a9">WebRTC · end-to-end encrypted · no uploads</text>
+</svg>

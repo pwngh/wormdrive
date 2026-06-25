@@ -1,3 +1,14 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
 // Receiver: join a share, browse its folder tree, preview and download.
 // The sender on the other end of the data channel is untrusted — every
 // message is shape-validated and transfers are size-capped (against the
@@ -9,7 +20,7 @@
 // requests always jump ahead of speculative ones; the wire still carries one
 // transfer at a time.
 
-import { el, fmtSize } from "./dom";
+import { el, fmtSize, staggerDelay } from "./dom";
 import { warpBurst } from "./fx/starfield";
 import { icon, kindIcon } from "./icons";
 import { basename, crumbs, listDir, type Row } from "./manifest";
@@ -18,9 +29,10 @@ import {
   LEVEL_BLURB,
   LEVEL_LABEL,
   LEVELS,
-  MAX_MANIFEST_ENTRIES,
   PREVIEWABLE,
   levelAllows,
+  sanitizeManifest,
+  validFileHeadSize,
   type FileEntry,
   type FileKind,
   type Level,
@@ -29,33 +41,6 @@ import {
 import { answerPeer } from "./rtc";
 import { Signal } from "./signaling";
 import { renderPreview, releasePreviewResources } from "./viewers";
-
-const KNOWN_KINDS = new Set(["text", "code", "pdf", "sheet", "doc", "image", "media", "other"]);
-const MAX_PATH_LENGTH = 1024;
-
-/** Validate an untrusted manifest from the sender; null = protocol violation. */
-function sanitizeManifest(value: unknown): FileEntry[] | null {
-  if (!Array.isArray(value) || value.length > MAX_MANIFEST_ENTRIES) return null;
-  const out: FileEntry[] = [];
-  for (const entry of value as FileEntry[]) {
-    if (
-      typeof entry?.path !== "string" ||
-      entry.path.length === 0 ||
-      entry.path.length > MAX_PATH_LENGTH ||
-      // Reject empty segments (leading/trailing/double slash) and ".." — the
-      // honest sender already does, and they derive nameless dirs/breadcrumbs.
-      entry.path.split("/").some((seg) => seg === "" || seg === "..") ||
-      entry.path.includes("\0") ||
-      !Number.isFinite(entry.size) ||
-      entry.size < 0 ||
-      !KNOWN_KINDS.has(entry.kind)
-    ) {
-      return null;
-    }
-    out.push({ path: entry.path, size: entry.size, kind: entry.kind });
-  }
-  return out;
-}
 
 interface Transfer {
   id: number;
@@ -93,13 +78,31 @@ const CACHE_ITEM_MAX = 8 * 1024 * 1024;
 const PREFETCH_SCAN_MAX = 768 * 1024; // idle folder scan
 const PREFETCH_SCAN_COUNT = 24;
 
+// Timings (ms).
+const STALL_TIMEOUT_MS = 20_000; // drop the "connecting…" state after this with NAT advice
+const HOVER_PREFETCH_MS = 120; // hover dwell before speculatively warming a file
+const IDLE_CALLBACK_TIMEOUT_MS = 800; // requestIdleCallback deadline for prefetch work
+const IDLE_FALLBACK_MS = 180; // setTimeout fallback where requestIdleCallback is absent
+
 const idle: (cb: () => void) => void =
   typeof window.requestIdleCallback === "function"
-    ? (cb) => window.requestIdleCallback(cb, { timeout: 800 })
-    : (cb) => window.setTimeout(cb, 180);
+    ? (cb) => window.requestIdleCallback(cb, { timeout: IDLE_CALLBACK_TIMEOUT_MS })
+    : (cb) => window.setTimeout(cb, IDLE_FALLBACK_MS);
 
 const noProgress: Transfer["onProgress"] = () => {};
 
+/**
+ * Mount the receiver UI into `root` for a given share: connect over the
+ * signaling relay, answer the sender's offer, then drive the file browser,
+ * preview overlay, and the optimistic transfer engine.
+ *
+ * Everything lives in this one closure rather than a class so the per-share
+ * state (data channel, manifest, queue, blob cache, viewer token) is captured
+ * by reference and torn down together when the tab navigates away — there is
+ * exactly one receiver per page and no need to instantiate more. `token` is the
+ * bearer secret from the share URL fragment; it is sent only over the
+ * established data channel (in `hello`), never to the relay.
+ */
 export function mountReceiver(root: HTMLElement, shareId: string, token: string): void {
   // ----- state -------------------------------------------------------------
   let dc: RTCDataChannel | null = null;
@@ -137,7 +140,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   const destroySlot = el("span");
   const header = el("header", { class: "share-head" }, [
     el("div", { class: "minw" }, [
-      el("p", { class: "brandline mono" }, ["worm", el("span", { class: "tick" }, ["·"]), "drive"]),
+      el("p", { class: "brandline mono" }, ["wormdrive"]),
       el("div", { class: "row gap" }, [ring, title, chipSlot]),
     ]),
     destroySlot,
@@ -149,17 +152,19 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     placeholder: "Filter this share — press /",
     "aria-label": "Filter files",
   }) as HTMLInputElement;
-  const sortNameBtn = el("button", { class: "sortbtn mono" }, ["name"]);
-  const sortSizeBtn = el("button", { class: "sortbtn mono" }, ["size"]);
+  const sortNameBtn = el("button", { class: "sortbtn mono", "aria-label": "Sort by name" }, ["name"]);
+  const sortSizeBtn = el("button", { class: "sortbtn mono", "aria-label": "Sort by size" }, ["size"]);
   const countLabel = el("span", { class: "mono dim count" });
   const toolbar = el("div", { class: "toolbar", hidden: true }, [
     el("div", { class: "searchwrap" }, [icon("search"), searchInput]),
     el("div", { class: "row gap center" }, [sortNameBtn, sortSizeBtn, countLabel]),
   ]);
 
-  const crumbBar = el("nav", { class: "crumbs mono" });
+  const crumbBar = el("nav", { class: "crumbs mono", "aria-label": "Breadcrumb" });
   const table = el("div", { class: "filetable" });
-  const message = el("p", { class: "dim centered" }, ["Knocking on the sender's tab…"]);
+  // role="status" => polite live region: connection progress and end-of-share
+  // messages are announced to screen readers as the text changes.
+  const message = el("p", { class: "dim centered", role: "status" }, ["Knocking on the sender's tab…"]);
   const hint = (keys: string[], what: string) =>
     el("span", { class: "hint" }, [...keys.map((k) => el("kbd", {}, [k])), ` ${what}`]);
   const hints = el("div", { class: "hints", hidden: true }, [
@@ -171,7 +176,14 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   ]);
   const browser = el("section", { class: "panel" }, [toolbar, crumbBar, table, message, hints]);
 
-  const overlay = el("div", { class: "overlay", hidden: true, tabindex: "-1" });
+  const overlay = el("div", {
+    class: "overlay",
+    hidden: true,
+    tabindex: "-1",
+    role: "dialog",
+    "aria-modal": "true",
+    "aria-labelledby": "ov-name",
+  });
 
   root.append(header, browser, overlay);
 
@@ -186,7 +198,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
         false,
       );
     }
-  }, 20_000);
+  }, STALL_TIMEOUT_MS);
 
   signal.on("error", (msg) => {
     fail(
@@ -223,6 +235,8 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       ring.className = "ring ended";
       title.textContent = "Share ended";
       dc = null;
+      peer.close();
+      signal.close();
       rejectAll(text);
       closeViewer();
       toolbar.hidden = true;
@@ -337,7 +351,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
           // the validated manifest promised for this path — otherwise a tiny
           // manifest entry could stream gigabytes and OOM the tab.
           const entry = manifest.find((e) => e.path === inflight!.path);
-          if (!entry || !Number.isFinite(msg.size) || msg.size < 0 || msg.size > entry.size) {
+          if (!entry || !validFileHeadSize(msg.size, entry.size)) {
             violation("file-head disagrees with the manifest.");
             return;
           }
@@ -533,9 +547,9 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     crumbBar.hidden = filterText !== "";
     const trail = crumbs(cwd);
     trail.forEach((crumb, index) => {
-      if (index > 0) crumbBar.append(el("span", { class: "sep" }, ["›"]));
+      if (index > 0) crumbBar.append(el("span", { class: "sep", "aria-hidden": "true" }, ["›"]));
       if (index === trail.length - 1) {
-        crumbBar.append(el("span", { class: "here" }, [crumb.name]));
+        crumbBar.append(el("span", { class: "here", "aria-current": "page" }, [crumb.name]));
       } else {
         const link = el("button", { class: "linkbtn mono" }, [crumb.name]);
         link.addEventListener("click", () => {
@@ -579,7 +593,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     let i = 0;
     for (const row of currentRows) {
       const node = renderRow(row);
-      node.style.animationDelay = `${Math.min(i++, 12) * 22}ms`;
+      node.style.animationDelay = staggerDelay(i++);
       table.append(node);
       rowNodes.push(node);
     }
@@ -635,6 +649,9 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       class: "cachedot",
       hidden: !blobCache.has(entry.path),
       title: "Ready — opens instantly",
+      // Decorative speed hint; the file opens the same either way. Hiding it
+      // keeps the row's accessible name to the filename, not a changing dot.
+      "aria-hidden": "true",
     });
     cacheDots.set(entry.path, dot);
     const node = el(
@@ -643,6 +660,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
         class: `filerow clickable${lockedOut ? " locked" : ""}`,
         tabindex: "0",
         role: "button",
+        "aria-disabled": lockedOut ? "true" : undefined,
         title: lockedOut ? "This preview-only link can't open this file type" : undefined,
       },
       [
@@ -659,7 +677,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
         hover = window.setTimeout(() => {
           if (ended || !PREVIEWABLE.has(entry.kind) || entry.size > CACHE_ITEM_MAX) return;
           requestFile(entry.path, "preview", "idle").catch(() => {});
-        }, 120);
+        }, HOVER_PREFETCH_MS);
       });
       node.addEventListener("mouseleave", () => window.clearTimeout(hover));
     }
@@ -674,7 +692,11 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     };
     node.addEventListener("click", act);
     node.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") act();
+      // role="button" must fire on Enter and Space; Space would scroll otherwise.
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        act();
+      }
     });
   }
 
@@ -768,12 +790,12 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     const restoreFocus = rowNodes[selected] ?? null;
 
     const kindChip = el("span", { class: "kind" });
-    const nameLabel = el("span", { class: "mono path ellipsis ovname" });
+    const nameLabel = el("span", { id: "ov-name", class: "mono path ellipsis ovname" });
     const sizeLabel = el("span", { class: "mono dim ovpos" });
     const posLabel = el("span", { class: "mono dim ovpos" });
-    const prevButton = el("button", { class: "iconbtn ovnav", title: "Previous (←)" }, [icon("chev-l")]);
-    const nextButton = el("button", { class: "iconbtn ovnav", title: "Next (→)" }, [icon("chev-r")]);
-    const closeButton = el("button", { class: "iconbtn ovnav ovclose", title: "Close (Esc)" }, [icon("x")]);
+    const prevButton = el("button", { class: "iconbtn ovnav", title: "Previous (←)", "aria-label": "Previous file" }, [icon("chev-l")]);
+    const nextButton = el("button", { class: "iconbtn ovnav", title: "Next (→)", "aria-label": "Next file" }, [icon("chev-r")]);
+    const closeButton = el("button", { class: "iconbtn ovnav ovclose", title: "Close (Esc)", "aria-label": "Close preview" }, [icon("x")]);
     const downloadButton = levelAllows(level, "download")
       ? el("button", { class: "btn small" }, [icon("download"), "Download"])
       : null;
@@ -800,12 +822,18 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     overlay.hidden = false;
     overlayOpen = true;
     document.body.classList.add("noscroll");
+    // Make the modal real: the background can't be tabbed into or read by AT
+    // while the viewer is open (inert also handles the focus trap).
+    header.inert = true;
+    browser.inert = true;
     overlay.focus();
 
     closeViewer = () => {
       overlay.hidden = true;
       overlayOpen = false;
       document.body.classList.remove("noscroll");
+      header.inert = false;
+      browser.inert = false;
       // Invalidate any in-flight preview load so its .then() can't render into
       // the now-detached body or create object URLs after the release below.
       token++;
@@ -917,8 +945,16 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   }
 }
 
+// Trigger a browser download of `blob` without ever exposing it as a navigable
+// resource: a synthetic <a download> click is the only cross-browser way to
+// save a Blob to disk with a chosen filename. The object URL is revoked on a
+// delay rather than immediately because some browsers begin the download
+// asynchronously after the click and would abort if the URL vanished first.
 function saveBlob(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
+  // The control-char range is intentional — strip path separators and control
+  // bytes from the download filename.
+  // eslint-disable-next-line no-control-regex
   const anchor = el("a", { href: url, download: name.replace(/[/\\\x00-\x1f]/g, "_") });
   document.body.append(anchor);
   anchor.click();

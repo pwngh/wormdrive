@@ -1,9 +1,20 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
 // Sender: stage files in this tab, mint the three permission links, and act
 // as the file server for connected peers over WebRTC data channels. All
 // permission and destruction decisions are made (and enforced) here.
 
-import { copyText, el, flash, fmtSize, randomId, safeEqual } from "./dom";
-import { warpBurst } from "./fx/starfield";
+import { copyText, el, flash, fmtSize, randomId, safeEqual, staggerDelay } from "./dom";
+import { warpBurst } from "./fx/blackhole";
 import { icon, kindIcon } from "./icons";
 import { classify, toManifest } from "./manifest";
 import {
@@ -12,8 +23,8 @@ import {
   LEVEL_BLURB,
   LEVEL_LABEL,
   MAX_MANIFEST_ENTRIES,
-  PREVIEWABLE,
   levelAllows,
+  permissionDenial,
   type Level,
   type ReceiverToSender,
   type SenderToReceiver,
@@ -21,6 +32,11 @@ import {
 import { offerPeer, sendWithBackpressure, type Peer } from "./rtc";
 import { Signal } from "./signaling";
 
+// Per-peer connection state. `dc` is null until the data channel opens, `level`
+// is null until the peer presents a valid token in its `hello` — both gates are
+// checked before serving anything. `busy` enforces one transfer at a time per
+// peer so a single channel can't fan out concurrent slices and starve its own
+// backpressure window.
 interface PeerCtx {
   id: string;
   peer: Peer;
@@ -29,11 +45,31 @@ interface PeerCtx {
   busy: boolean;
 }
 
+// A file the user has queued, paired with its share-relative path. `path` is the
+// manifest key (folder structure preserved); `file` is the live File handle we
+// slice from on demand — nothing is read into memory until a peer asks for it.
 interface Staged {
   path: string;
   file: File;
 }
 
+// Timings (ms).
+const DENY_DROP_MS = 250; // let the "deny" frame flush before closing the peer
+const COUNTDOWN_TICK_MS = 1000; // self-destruct countdown refresh cadence
+
+/**
+ * Mount the sender UI into `root` and own the entire share lifecycle: staging
+ * files, opening the share (minting one token per permission level), serving
+ * file bytes over WebRTC data channels, and destroying everything on demand or
+ * on self-destruct.
+ *
+ * Everything lives inside this closure on purpose. The share's secrets — the
+ * three tokens and the staged File handles — never leave the sender tab, so
+ * there is no module-level state to leak across tabs or to accidentally persist;
+ * a teardown that drops the closure's references is a complete wipe. Permission
+ * and destruction are enforced here (not at the relay), because the relay only
+ * forwards opaque signaling and never sees a token or a file.
+ */
 export function mountSender(root: HTMLElement): void {
   // ----- state -------------------------------------------------------------
   const staged = new Map<string, File>();
@@ -47,15 +83,17 @@ export function mountSender(root: HTMLElement): void {
   let countdownTimer = 0;
 
   // ----- skeleton ----------------------------------------------------------
-  const notice = el("p", { class: "notice", hidden: true });
+  // role="alert" => implicit aria-live=assertive: errors/warnings are announced.
+  const notice = el("p", { class: "notice", hidden: true, role: "alert" });
   const nameInput = el("input", {
+    id: "share-name",
     class: "field",
     type: "text",
     placeholder: "Share name",
     value: "Shared files",
     maxlength: "80",
   });
-  const destructSelect = el("select", { class: "field" }, []);
+  const destructSelect = el("select", { id: "self-destruct", class: "field" }, []);
   for (const [label, minutes] of [
     ["No timer", 0],
     ["After 5 minutes", 5],
@@ -74,7 +112,6 @@ export function mountSender(root: HTMLElement): void {
     "div",
     { class: "dropzone portal", tabindex: "0", role: "button", "aria-label": "Add files to the share" },
     [
-      el("div", { class: "portal-ring", "aria-hidden": "true" }),
       el("div", { class: "portal-core" }, [
         el("p", { class: "dropzone-title" }, ["Drop files into the drive"]),
         el("p", { class: "dropzone-sub" }, ["or"]),
@@ -91,9 +128,6 @@ export function mountSender(root: HTMLElement): void {
     if ((event.target as HTMLElement).closest("button")) return;
     fileInput.click();
   });
-  const portalNote = el("p", { class: "portal-note dim" }, [
-    "Nothing uploads anywhere — files stream from this tab, peer to peer.",
-  ]);
 
   const stagedTable = el("div", { class: "filetable" });
   const totalLine = el("span", { class: "mono dim total" });
@@ -106,11 +140,11 @@ export function mountSender(root: HTMLElement): void {
     ]),
     stagedTable,
     el("div", { class: "controls" }, [
-      el("label", { class: "fgroup" }, [
+      el("label", { class: "fgroup", for: "share-name" }, [
         el("span", { class: "flabel" }, ["Share name"]),
         nameInput,
       ]),
-      el("label", { class: "fgroup" }, [
+      el("label", { class: "fgroup", for: "self-destruct" }, [
         el("span", { class: "flabel" }, ["Self-destruct"]),
         destructSelect,
       ]),
@@ -120,7 +154,7 @@ export function mountSender(root: HTMLElement): void {
 
   const linksBox = el("div", { class: "tickets" });
   const peersBox = el("div", { class: "peers" });
-  const statusLine = el("p", { class: "mono dim status" });
+  const statusLine = el("p", { class: "mono dim status", "aria-live": "polite" });
   const destroyButton = el("button", { class: "btn danger small" }, [icon("trash"), "Destroy share"]);
   const livePanel = el("section", { class: "panel", hidden: true }, [
     el("div", { class: "panel-head" }, [
@@ -133,17 +167,23 @@ export function mountSender(root: HTMLElement): void {
   ]);
 
   root.classList.add("wide");
+  // The idle landing sits directly on the black hole: its `.dropzone` is centered
+  // on the hole's dark shadow (fx/blackhole guarantees this). Wrapping it lets the
+  // idle screen center over the hole while the wide two-pane workbench still spreads
+  // once files are staged.
   root.append(
-    el("header", { class: "hero" }, [
-      el("h1", { class: "wordmark" }, ["worm", el("span", { class: "tick" }, ["·"]), "drive"]),
-      el("p", { class: "tagline" }, [
-        "Share a folder straight from your browser. Three links, three permission levels, gone when you say so.",
+    el("div", { class: "landing panel" }, [
+      el("header", { class: "hero" }, [
+        el("h1", { class: "wordmark" }, ["wormdrive"]),
+        el("p", { class: "tagline" }, [
+          "Share a folder straight from your browser.",
+        ]),
       ]),
-    ]),
-    notice,
-    el("div", { class: "workbench" }, [
-      el("div", { class: "wb-left" }, [dropZone, portalNote, fileInput, dirInput]),
-      el("div", { class: "wb-right" }, [stagePanel, livePanel]),
+      notice,
+      el("div", { class: "workbench" }, [
+        el("div", { class: "wb-left" }, [dropZone, fileInput, dirInput]),
+        el("div", { class: "wb-right" }, [stagePanel, livePanel]),
+      ]),
     ]),
   );
 
@@ -153,9 +193,18 @@ export function mountSender(root: HTMLElement): void {
     let dropped = 0;
     for (const { path, file } of items) {
       const clean = path.replace(/^\/+/, "");
-      // Mirror the receiver's manifest validation exactly, or an honest large
-      // folder would build a manifest the receiver rejects and disconnects on.
-      if (clean.length === 0 || clean.split("/").some((seg) => seg === "" || seg === "..")) continue;
+      // Mirror the receiver's manifest path-shape validation (sanitizeManifest in
+      // protocol.ts) so an honest folder doesn't build a manifest the receiver
+      // rejects and disconnects on. The receiver caps path length at 1024 and
+      // rejects NUL bytes, so a single offending entry would void the whole
+      // manifest there; skip it here too rather than serve a share that dies.
+      if (
+        clean.length === 0 ||
+        clean.length > 1024 ||
+        clean.includes("\0") ||
+        clean.split("/").some((seg) => seg === "" || seg === "..")
+      )
+        continue;
       if (!staged.has(clean) && staged.size >= MAX_MANIFEST_ENTRIES) {
         dropped += 1;
         continue;
@@ -193,7 +242,7 @@ export function mountSender(root: HTMLElement): void {
     let i = 0;
     for (const entry of manifest) {
       total += entry.size;
-      const delay = `${Math.min(i++, 12) * 22}ms`;
+      const delay = staggerDelay(i++);
       stagedTable.append(
         el("div", { class: "filerow", style: `animation-delay: ${delay}` }, [
           kindIcon(entry.kind),
@@ -313,7 +362,13 @@ export function mountSender(root: HTMLElement): void {
     linksBox.replaceChildren();
     for (const level of LEVELS) {
       const url = linkFor(level);
-      const copyButton = el("button", { class: "btn small" }, ["Copy link"]);
+      // All three copy buttons read "Copy link" — give each a distinct
+      // accessible name so screen-reader users can tell them apart.
+      const copyButton = el(
+        "button",
+        { class: "btn small", "aria-label": `Copy ${LEVEL_LABEL[level]} link` },
+        ["Copy link"],
+      );
       copyButton.addEventListener("click", () => {
         warpBurst();
         void copyText(url).then((ok) => flash(copyButton, ok ? "Copied" : "Copy failed"));
@@ -418,13 +473,17 @@ export function mountSender(root: HTMLElement): void {
 
     if (msg.t === "hello") {
       if (!tokens || typeof msg.token !== "string") return;
+      // Test the presented token against every level with a constant-time
+      // compare, and don't break on the first hit: a short-circuit would leak
+      // which level matched (and whether one did) through timing. The tokens are
+      // distinct random ids, so at most one can match.
       let granted: Level | null = null;
       for (const level of LEVELS) {
         if (safeEqual(tokens[level], msg.token)) granted = level;
       }
       if (!granted) {
         sendCtl(ctx, { t: "deny", reason: "Bad or revoked link." });
-        window.setTimeout(() => dropPeer(ctx.id), 250);
+        window.setTimeout(() => dropPeer(ctx.id), DENY_DROP_MS);
         return;
       }
       ctx.level = granted;
@@ -447,12 +506,9 @@ export function mountSender(root: HTMLElement): void {
         sendCtl(ctx, { t: "file-err", id: msg.id, reason: "Gone — that file was destroyed." });
         return;
       }
-      if (msg.intent === "download" && !levelAllows(ctx.level, "download")) {
-        sendCtl(ctx, { t: "file-err", id: msg.id, reason: "This link is preview-only." });
-        return;
-      }
-      if (ctx.level === "view" && !PREVIEWABLE.has(classify(msg.path))) {
-        sendCtl(ctx, { t: "file-err", id: msg.id, reason: "This link can only open previewable files." });
+      const denied = permissionDenial(ctx.level, classify(msg.path), msg.intent);
+      if (denied) {
+        sendCtl(ctx, { t: "file-err", id: msg.id, reason: denied });
         return;
       }
       if (ctx.busy) {
@@ -480,6 +536,10 @@ export function mountSender(root: HTMLElement): void {
     sendCtl(ctx, { t: "file-head", id, path, size: file.size, mime: file.type || "application/octet-stream" });
     try {
       for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
+        // Re-check ownership every chunk, not just at the start: a transfer can
+        // span seconds, and the user may remove or replace this path mid-stream.
+        // Comparing the File identity (not just presence) also catches a re-add
+        // of the same path with different bytes, so we never splice two files.
         if (staged.get(path) !== file) {
           sendCtl(ctx, { t: "file-err", id, reason: "Transfer stopped — the file was destroyed." });
           return;
@@ -515,7 +575,7 @@ export function mountSender(root: HTMLElement): void {
     if (minutes <= 0) return;
     destructAt = Date.now() + minutes * 60_000;
     destructTimer = window.setTimeout(() => destroyShare("Share self-destructed."), minutes * 60_000);
-    countdownTimer = window.setInterval(renderStatus, 1000);
+    countdownTimer = window.setInterval(renderStatus, COUNTDOWN_TICK_MS);
   }
 
   function countdownText(): string {
@@ -558,10 +618,16 @@ export function mountSender(root: HTMLElement): void {
 // Drag-and-drop traversal (files and whole folders)
 // ---------------------------------------------------------------------------
 
+// Flatten a drop into staged entries, expanding any dropped folders to their
+// files. We prefer the non-standard `webkitGetAsEntry` path because it's the
+// only API that recovers folder structure (and nested files) from a drop;
+// `getAsFile` is the flat fallback for browsers/items that don't expose entries.
 async function collectDrop(dt: DataTransfer): Promise<Staged[]> {
   const out: Staged[] = [];
   const walks: Promise<void>[] = [];
-  // webkitGetAsEntry must be called synchronously inside the drop handler.
+  // webkitGetAsEntry must be called synchronously inside the drop handler:
+  // the DataTransferItem list is cleared once the event handler returns, so the
+  // entries are grabbed here and the async folder walks run afterward.
   for (const item of [...dt.items]) {
     const entry = typeof item.webkitGetAsEntry === "function" ? item.webkitGetAsEntry() : null;
     if (entry) {
@@ -575,6 +641,10 @@ async function collectDrop(dt: DataTransfer): Promise<Staged[]> {
   return out;
 }
 
+// Depth-first walk of one dropped entry, accumulating files into `out` with
+// their full relative path. `readEntries` returns directory children in capped
+// batches (~100), so we loop until it yields an empty batch — a single call is
+// not guaranteed to return every child.
 async function walkEntry(entry: FileSystemEntry, prefix: string, out: Staged[]): Promise<void> {
   if (entry.isFile) {
     const file = await new Promise<File>((resolve, reject) =>

@@ -1,9 +1,9 @@
 /* ── wormdrive ───────────────────────────────────────────────────────────────
-   The void: a deep blue-black field with faint violet/teal nebulae and a
-   hand-rolled starfield canvas behind everything. The signature element is
-   the aperture — an amber event-horizon ring that IS the drop zone on the
-   sender and the status ring on the receiver. Amber is the only loud voice;
-   panels are quiet glass floating over space.
+   The void: a deep blue-black field with faint violet/teal nebulae. The
+   signature element is the black hole — a lensed, Interstellar-style accretion
+   disk (a WebGL canvas, fx/blackhole) centered on the sender's drop zone, with a
+   hand-rolled starfield drifting behind it. Amber is the only loud voice; panels
+   are quiet glass floating over space.
 */
 
 /* Self-hosted fonts (latin subset) — no third-party CDN, no IP leak.
@@ -39,7 +39,7 @@
   --line-strong: rgba(229, 226, 214, 0.17);
   --ink: #e9e6db;
   --dim: #959fb0;
-  --faint: #5e6878;
+  --faint: #8b95a9; /* AA: ~5:1 on the panel/void background (was #5e6878, ~2.5:1) */
   --accent: #f5a524;
   --accent-hot: #ffc75a;
   --accent-ink: #1a1206;
@@ -65,14 +65,21 @@ button, select, input, [role="button"] { touch-action: manipulation; }
 html, body {
   margin: 0;
   min-height: 100%;
+  color: var(--ink);
+  font: 15.5px/1.6 "Space Grotesk", system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+/* The void + nebulae live on <html> only, so they paint as the viewport
+   backdrop *behind* the negative-z-index canvases (fx/blackhole, fx/starfield).
+   On <body> this background would paint OVER those canvases — body's box is in
+   normal flow, which the painting order puts above negative-z children — and
+   hide the black hole entirely. Body stays transparent. */
+html {
   background:
     radial-gradient(900px 620px at 50% 26%, var(--nebula-violet), transparent 62%),
     radial-gradient(760px 540px at 80% 78%, var(--nebula-teal), transparent 65%),
     var(--void);
   background-attachment: fixed;
-  color: var(--ink);
-  font: 15.5px/1.6 "Space Grotesk", system-ui, -apple-system, sans-serif;
-  -webkit-font-smoothing: antialiased;
 }
 
 body.noscroll { overflow: hidden; }
@@ -92,14 +99,19 @@ body.noscroll { overflow: hidden; }
 }
 ::-webkit-scrollbar-track { background: transparent; }
 
-/* The starfield canvas sits behind the page; nebulae show through its
-   transparent clears, stars drift on top of them. */
+/* Two stacked full-viewport canvases sit behind the page. The starfield (.space)
+   is the back layer; the black hole (.space-bh, fx/blackhole) rides one layer
+   above it — its transparent sky lets the field drift through, its shadow stays
+   opaque. Both let the CSS nebulae/void show through where they're clear. */
 .space {
   position: fixed;
   inset: 0;
-  z-index: -1;
+  width: 100%;
+  height: 100%;
+  z-index: -2;
   pointer-events: none;
 }
+.space-bh { z-index: -1; }
 
 .mono { font-family: var(--mono); }
 .dim { color: var(--dim); }
@@ -121,6 +133,65 @@ body.noscroll { overflow: hidden; }
     max(24px, env(safe-area-inset-right))
     max(40px, env(safe-area-inset-bottom))
     max(24px, env(safe-area-inset-left));
+}
+
+/* ── landing ─────────────────────────────────────────────────────────────────
+   The sender's content rides in ONE glass panel sitting on the WebGL black hole
+   (fx/blackhole). Idle: it holds the wordmark + drop CTA. Once files are staged
+   it grows to hold the staged-files + share-link sections too — one panel, not
+   several floating cards: the old per-section panels nest inside it, bare. The
+   hole's shadow sits behind it; its disk + photon ring wrap the edges. */
+.landing {
+  position: relative;
+  width: 100%;
+  max-width: 560px;
+  margin: 0 auto;
+}
+.landing.panel { padding: clamp(26px, 4vw, 42px) clamp(22px, 4vw, 38px); }
+
+/* Idle: the landing carries .panel but stays chrome-less so the black hole and
+   its inner core read uncovered. It only materialises into the one glass panel
+   once files are staged (below). */
+.landing.panel:not(:has(.wb-right > .panel:not([hidden]))) {
+  background: var(--panel);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: none;
+  box-shadow: none;
+}
+
+/* Center the idle landing in the viewport so the .dropzone (hence the shadow)
+   lands dead center, footer pushed to the bottom. align-items centers it
+   horizontally; the auto top/bottom margins center it vertically. Idle only —
+   once a panel is visible the wide workbench takes over. */
+.app:has(.landing):not(:has(.wb-right > .panel:not([hidden]))) {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-height: 100svh;
+}
+.app:has(.landing):not(:has(.wb-right > .panel:not([hidden]))) > .landing {
+  margin: auto 0;
+}
+
+/* Staged/live: the one panel widens to fit the two-pane workbench, and the old
+   per-section panels nest BARE inside it — no panel-in-panel chrome, just
+   sections split by a hairline. */
+.landing.panel:has(.wb-right > .panel:not([hidden])) { max-width: min(96vw, 1000px); }
+.landing.panel .panel {
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+  margin: 0;
+}
+.landing.panel .wb-right > .panel:not([hidden]) + .panel {
+  margin-top: 20px;
+  padding-top: 20px;
+  border-top: 1px solid var(--line);
 }
 
 /* ── icons ── */
@@ -152,16 +223,14 @@ svg.icon {
   font-weight: 700;
   letter-spacing: -0.025em;
   margin: 0;
-}
-.wordmark .tick {
-  color: var(--accent);
-  text-shadow: 0 0 16px rgba(245, 165, 36, 0.5);
+  text-shadow: 0 2px 22px rgba(0, 0, 0, 0.9), 0 0 3px rgba(0, 0, 0, 0.8);
 }
 .tagline {
   margin: 10px auto 0;
   color: var(--dim);
   max-width: 52ch;
   text-wrap: balance;
+  text-shadow: 0 2px 22px rgba(0, 0, 0, 0.9), 0 0 3px rgba(0, 0, 0, 0.8);
 }
 
 /* ── layout helpers ── */
@@ -240,72 +309,33 @@ svg.icon {
   font-size: 14px;
 }
 
-/* ── the aperture (sender drop zone) ─────────────────────────────────────────
-   A circular portal: a slow amber sheen orbits the rim; drag-over tightens
-   the orbit and brightens the horizon. The starfield bursts in sympathy
-   (see fx/starfield.ts).
-*/
+/* ── the drop zone ───────────────────────────────────────────────────────────
+   The black hole (fx/blackhole) is centered on this circle, so the aperture is
+   now a transparent target sitting over the hole's dark shadow — the photon ring
+   is the visual. Text-shadows carry the copy where it drifts onto the disk. */
 .dropzone { cursor: pointer; }
 .dropzone:focus-visible { outline-offset: 8px; border-radius: 50%; }
 
+/* Just the CTA target over the hole — sized to its content, not a big circle,
+   so the landing fits one screen. The hole's size is FOV-based (independent of
+   this box) and drag-drop is bound to the whole window, so small is fine. */
 .portal {
   position: relative;
-  width: min(72vw, 320px);
-  aspect-ratio: 1;
-  margin: 18px auto 16px;
-  border-radius: 50%;
+  width: min(82vw, 440px);
+  margin: 8px auto;
+  padding: 30px 24px;
   display: grid;
   place-items: center;
   text-align: center;
-  background: radial-gradient(
-    closest-side,
-    rgba(11, 14, 20, 0) 52%,
-    rgba(245, 165, 36, 0.06) 76%,
-    rgba(11, 14, 20, 0) 100%
-  );
-  box-shadow:
-    0 0 90px rgba(245, 165, 36, 0.07),
-    inset 0 0 80px rgba(43, 30, 74, 0.55);
-  transition: transform 0.2s, box-shadow 0.2s;
 }
-.portal:hover,
-.dropzone.over.portal,
-.dropzone:focus-visible.portal {
-  transform: scale(1.012);
-  box-shadow:
-    0 0 110px rgba(245, 165, 36, 0.15),
-    inset 0 0 80px rgba(43, 30, 74, 0.55);
-}
-
-.portal-ring {
-  position: absolute;
-  inset: 6px;
-  border-radius: 50%;
-  pointer-events: none; /* overlay must never eat clicks meant for the core */
-  background:
-    conic-gradient(
-      from 0deg,
-      transparent 0 8%,
-      rgba(245, 165, 36, 0.85) 16%,
-      var(--accent-hot) 20%,
-      rgba(245, 165, 36, 0.85) 24%,
-      transparent 34% 100%
-    ),
-    conic-gradient(rgba(245, 165, 36, 0.22) 0 100%);
-  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
-  mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2px));
-  animation: orbit 16s linear infinite;
-}
-.portal:hover .portal-ring,
-.dropzone.over .portal-ring,
-.dropzone:focus-visible .portal-ring {
-  animation-duration: 3.5s;
-  filter: brightness(1.35) drop-shadow(0 0 6px rgba(245, 165, 36, 0.5));
-}
-@keyframes orbit { to { transform: rotate(360deg); } }
 
 .portal-core { padding: 0 36px; }
-.dropzone-title { font-size: 17.5px; font-weight: 600; margin: 0 0 8px; }
+.dropzone-title {
+  font-size: 17.5px;
+  font-weight: 600;
+  margin: 0 0 8px;
+  text-shadow: 0 2px 22px rgba(0, 0, 0, 0.9), 0 0 3px rgba(0, 0, 0, 0.8);
+}
 .dropzone-sub {
   margin: 0 0 12px;
   color: var(--faint);
@@ -313,12 +343,14 @@ svg.icon {
   font-size: 10.5px;
   letter-spacing: 0.22em;
   text-transform: uppercase;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.9);
 }
 .portal-note {
   text-align: center;
   max-width: 46ch;
   margin: 0 auto 30px;
   font-size: 13.5px;
+  text-shadow: 0 2px 18px rgba(0, 0, 0, 0.9);
 }
 
 /* ── fields & buttons ── */
@@ -399,7 +431,7 @@ select.field {
 }
 .btn.danger { border-color: rgba(229, 72, 77, 0.55); color: var(--danger); background: transparent; }
 .btn.danger:hover:not(:disabled) { background: rgba(229, 72, 77, 0.1); border-color: var(--danger); }
-.btn.ghost { background: rgba(11, 14, 21, 0.45); }
+.btn.ghost { background: rgba(16, 20, 29, 0.82); } /* opaque enough to read over the disk */
 .btn.small { padding: 6px 12px; font-size: 13.5px; }
 
 .iconbtn {
@@ -613,7 +645,6 @@ select.field {
   text-transform: uppercase;
   color: var(--faint);
 }
-.brandline .tick { color: var(--accent); }
 .share-title {
   font-size: 22px;
   font-weight: 700;

@@ -47,7 +47,7 @@ done
 die() { printf 'configure: %s\n' "$1" >&2; exit 1; }
 
 case $DOMAIN in
-	''|*[!A-Za-z0-9.-]*) die "invalid --domain '$DOMAIN' (allowed: A-Z a-z 0-9 . -)" ;;
+	''|.*|*.|*[!A-Za-z0-9.-]*) die "invalid --domain '$DOMAIN' (allowed: A-Z a-z 0-9 . -; no leading/trailing dot)" ;;
 esac
 case $PORT in
 	''|*[!0-9]*) die "invalid --port '$PORT' (digits only)" ;;

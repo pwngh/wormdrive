@@ -1,10 +1,21 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
 // Fetch + cache the self-hosted webfonts (latin subset) into public/fonts/.
 // Runs automatically before `dev` and `build` via npm pre-hooks. The fonts are
 // gitignored, not vendored, so the repo carries no binaries.
 //
 // Idempotent: skips files already present. Network-tolerant: if the fetch
-// fails (offline, CDN down, Google rotated the hashes), it warns and exits 0 —
-// the app then falls back to the system font stack declared in styles.css.
+// fails (offline, CDN down), it warns and exits 0 — the app then falls back
+// to the system font stack declared in styles.css.
 // We parse the live css2 API rather than pinning gstatic URLs so a hash
 // rotation doesn't silently 404.
 import { mkdir, writeFile, access } from "node:fs/promises";
@@ -20,6 +31,8 @@ const UA =
 
 // Map a CSS @font-face block to a stable local filename. Space Grotesk is a
 // variable font (one file for all weights); IBM Plex Mono ships per-weight.
+// Returns null for any family we don't self-host, which the loop treats as the
+// signal to skip the block — so an unexpected face Google adds never gets written.
 const localName = (family, weight) =>
   family === "Space Grotesk"
     ? "space-grotesk-var.woff2"
@@ -38,7 +51,9 @@ for (const f of WANTED) if (!(await exists(join(OUT, f)))) missing.push(f);
 if (missing.length === 0) process.exit(0); // all cached
 
 try {
-  const css = await (await get(CSS_URL)).text();
+  const cssRes = await get(CSS_URL);
+  if (!cssRes.ok) throw new Error(`css2 API ${cssRes.status} ${cssRes.statusText}`);
+  const css = await cssRes.text();
   const written = new Set();
   for (const block of css.split("@font-face").slice(1)) {
     const range = (block.match(/unicode-range:\s*([^;]+);/) || [])[1] || "";
@@ -49,7 +64,12 @@ try {
     const name = family && url && localName(family, weight);
     if (!name || written.has(name)) continue; // variable font repeats per weight
     written.add(name);
-    const buf = Buffer.from(await (await get(url)).arrayBuffer());
+    const res = await get(url);
+    if (!res.ok) {
+      console.warn(`[fonts] ${name}: ${res.status} ${res.statusText} — skipping`);
+      continue;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
     await writeFile(join(OUT, name), buf);
     console.log(`[fonts] ${name} (${buf.length} bytes)`);
   }

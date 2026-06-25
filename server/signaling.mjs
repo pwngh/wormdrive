@@ -1,3 +1,14 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
 // wormdrive signaling server
 // Relays WebRTC offers/answers/ICE between a share's host and its receivers,
 // and (in production) serves the built frontend from ../dist.
@@ -51,10 +62,16 @@ const MIME = {
 const rooms = new Map();
 let nextPeer = 1;
 
+// Guard every send on OPEN: a socket can close between when we look it up in a
+// room and when we write to it, and ws throws on a send to a closing/closed
+// socket — which here would surface as an uncaught exception.
 function send(ws, msg) {
   if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
 }
 
+// Tear down a room and notify its peers. "gone" tells receivers the host is
+// done so they stop waiting on a data channel that will never open; we drop the
+// map entry last so a late message during teardown can't re-find the room.
 function closeRoom(shareId) {
   const room = rooms.get(shareId);
   if (!room) return;
@@ -62,12 +79,27 @@ function closeRoom(shareId) {
   rooms.delete(shareId);
 }
 
-const MAX_PEERS_PER_ROOM = 32;
-const MAX_ROOMS = 5000;
+// Caps default to production values; the env overrides exist only so the smoke
+// suite can exercise them cheaply (a tiny cap, a short grace) instead of opening
+// 5000 sockets or waiting 30s for the reaper. A malformed override falls back to
+// the default rather than silently disabling the cap (NaN) or zeroing it ("").
+const intCap = (v, d) => {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : d;
+};
+const MAX_PEERS_PER_ROOM = intCap(process.env.WORMDRIVE_MAX_PEERS, 32);
+const MAX_ROOMS = intCap(process.env.WORMDRIVE_MAX_ROOMS, 5000);
 
+// Dispatch one validated client frame. The protocol is deliberately tiny —
+// create/join/signal/close — and the server only brokers identities and relays
+// opaque SDP/ICE blobs; it never inspects or stores their contents. Unknown
+// frame types are dropped silently rather than answered, so a probing client
+// learns nothing about the protocol from error replies.
 function handleMessage(ws, msg) {
   switch (msg.t) {
     case "create": {
+      // Bound the id length before it ever becomes a map key, so a peer can't
+      // grow the rooms map's key footprint with an arbitrarily long string.
       if (typeof msg.shareId !== "string" || msg.shareId.length > 64) return;
       const existing = rooms.get(msg.shareId);
       // Check for a clash BEFORE shedding our own role: a rejected create must
@@ -130,10 +162,14 @@ function handleMessage(ws, msg) {
       const room = rooms.get(role.shareId);
       if (!room) return;
       if (role.kind === "host") {
+        // A host addresses one named peer; a missing target is silently dropped
+        // (the peer may have left mid-handshake) rather than erroring back.
         const target = room.peers.get(msg.to);
         if (target) send(target, { t: "signal", from: "host", data: msg.data });
       } else {
-        // Peers may only address the host.
+        // Peers may only address the host. The relay stamps the sender's peerId
+        // server-side rather than trusting msg.from, so one peer can't
+        // impersonate another in the host's signaling exchange.
         send(room.host, { t: "signal", from: role.peerId, data: msg.data });
       }
       return;
@@ -147,6 +183,10 @@ function handleMessage(ws, msg) {
   }
 }
 
+// Clean up whatever role a disconnecting socket held. A host leaving tears down
+// the whole room (its share is over); a peer leaving only removes itself and
+// tells the host so the host can prune that peer's connection. Also invoked
+// from "create" to shed a stale role before adopting a new one.
 function handleClose(ws) {
   const role = ws.role;
   if (!role) return;
@@ -162,6 +202,9 @@ function handleClose(ws) {
 }
 
 // ── static serving (production) ─────────────────────────────────────────────
+// Serve ../dist for non-WS requests. Read-only (GET/HEAD), confined to DIST via
+// a normalized-path prefix check so a "../" can't escape the build dir, and any
+// unmatched path falls back to index.html so the client-side router owns routing.
 async function serveStatic(req, res) {
   if (req.method !== "GET" && req.method !== "HEAD") {
     res.writeHead(405, { allow: "GET, HEAD" }).end();
@@ -223,6 +266,8 @@ const server = createServer(serveStatic);
 const wss = new WebSocketServer({
   server,
   path: WS_PATH,
+  // Signaling frames carry only SDP/ICE blobs; 256 KiB is generous headroom.
+  // ws drops the socket on any larger frame, capping per-message memory.
   maxPayload: 256 * 1024,
 });
 wss.on("error", (err) => console.error("[wormdrive] wss error:", err.message));
@@ -252,7 +297,8 @@ wss.on("connection", (ws) => {
   });
 });
 
-const ROLE_GRACE_MS = 30_000;
+const ROLE_GRACE_MS = intCap(process.env.WORMDRIVE_ROLE_GRACE_MS, 30_000);
+const HEARTBEAT_MS = intCap(process.env.WORMDRIVE_HEARTBEAT_MS, 30_000);
 const heartbeat = setInterval(() => {
   const now = Date.now();
   for (const ws of wss.clients) {
@@ -268,7 +314,7 @@ const heartbeat = setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   }
-}, 30_000);
+}, HEARTBEAT_MS);
 wss.on("close", () => clearInterval(heartbeat));
 
 server.listen(PORT, () => {

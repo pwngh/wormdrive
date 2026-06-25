@@ -1,3 +1,21 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
+/**
+ * Text and source-code preview backed by highlight.js. Renders a received blob as
+ * syntax-highlighted text in the preview container; nothing leaves the page. Lives behind
+ * the viewer registry in ./index. See renderText for the size and cost caps that keep a
+ * huge or pathological file from stalling the main thread.
+ */
+
 import hljs from "highlight.js/lib/common";
 import dockerfile from "highlight.js/lib/languages/dockerfile";
 import "highlight.js/styles/github-dark.css";
@@ -8,7 +26,9 @@ import { TEXT_PREVIEW_CAP } from "../protocol";
 
 hljs.registerLanguage("dockerfile", dockerfile);
 
-/** Map file extensions to highlight.js language names where they differ. */
+// Map file extensions to highlight.js language names where they differ. Only the
+// mismatches live here; an extension that already equals its hljs language (json,
+// css, go, ...) is passed through untouched at the call site, so it needs no entry.
 const LANG: Record<string, string> = {
   ts: "typescript",
   tsx: "typescript",
@@ -45,6 +65,16 @@ const LANG: Record<string, string> = {
 
 const AUTO_DETECT_CAP = 100 * 1024; // auto-detection is O(n * languages); keep it for small files
 
+/**
+ * Render a received blob as syntax-highlighted text into 'container'.
+ *
+ * Highlighting strategy is tiered by cost: a known extension/Dockerfile maps
+ * straight to a hljs language and skips detection entirely; otherwise we fall back
+ * to 'highlightAuto', but only under AUTO_DETECT_CAP since auto-detect runs every
+ * registered grammar over the input. Past that cap we render plain text rather than
+ * stall the viewer on a large file. The TEXT_PREVIEW_CAP slice keeps even a huge
+ * file from being fully decoded into the DOM — this is a preview, not the download.
+ */
 export async function renderText(container: HTMLElement, name: string, blob: Blob): Promise<void> {
   const truncated = blob.size > TEXT_PREVIEW_CAP;
   const slice = truncated ? blob.slice(0, TEXT_PREVIEW_CAP) : blob;
@@ -53,7 +83,10 @@ export async function renderText(container: HTMLElement, name: string, blob: Blo
   const text = truncated ? (await slice.text()).replace(/�$/, "") : await slice.text();
 
   const e = ext(name);
-  const lang = LANG[e] ?? (name.toLowerCase() === "dockerfile" ? "dockerfile" : e);
+  // Dockerfile has no extension, so it's matched by full filename rather than via LANG.
+  // Anything not in LANG falls through to the raw extension, which hljs.getLanguage
+  // then validates below before we trust it as a language.
+  const lang = Object.hasOwn(LANG, e) ? LANG[e] : (name.toLowerCase() === "dockerfile" ? "dockerfile" : e);
 
   const code = el("code");
   if (lang && hljs.getLanguage(lang)) {

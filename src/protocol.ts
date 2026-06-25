@@ -1,7 +1,20 @@
+/**
+ * @pwngh/wormdrive
+ *
+ * Copyright (c) Preston Neal
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE.md file in the root directory of this source tree.
+ *
+ * @license MIT
+ */
+
 // Wire protocol: constants and message shapes shared by sender, receiver,
 // and (informally) the signaling relay. The signaling server never inspects
 // payloads beyond routing fields, and never sees tokens or file bytes.
 
+/** Relay WebSocket path. Shared so the client connects exactly where the
+ *  signaling server listens — a mismatch fails silently as a 404 upgrade. */
 export const WS_PATH = "/ws";
 
 /** Data-channel chunk size. 64 KiB is safely under every browser's
@@ -29,7 +42,13 @@ export const ICE_SERVERS: RTCIceServer[] = [
 // Permission model
 // ---------------------------------------------------------------------------
 
+/** A link's privilege level. The string is what travels on the wire in a
+ *  `grant`, so renaming a variant is a protocol break, not a refactor. */
 export type Level = "view" | "download" | "manage";
+
+/** The levels in ascending privilege order. Ordering is load-bearing: the UI
+ *  renders the picker in this order and code may compare by index, so "view"
+ *  must stay least-privileged and "manage" most. */
 export const LEVELS: readonly Level[] = ["view", "download", "manage"] as const;
 
 export const LEVEL_LABEL: Record<Level, string> = {
@@ -44,6 +63,10 @@ export const LEVEL_BLURB: Record<Level, string> = {
   manage: "everything + destroy the share",
 };
 
+/** Whether a link `level` may perform a privileged `action`. The trust boundary
+ *  is the sender's browser — the receiver UI uses this only to hide controls;
+ *  the sender re-checks before serving bytes or destroying. Previewing isn't
+ *  gated here (every level may preview previewable files). */
 export function levelAllows(level: Level, action: "download" | "destroy"): boolean {
   switch (action) {
     case "download":
@@ -57,16 +80,18 @@ export function levelAllows(level: Level, action: "download" | "destroy"): boole
 // Manifest
 // ---------------------------------------------------------------------------
 
-export type FileKind =
-  | "text"
-  | "code"
-  | "pdf"
-  | "sheet"
-  | "doc"
-  | "image"
-  | "media"
-  | "other";
+/** Every preview kind in one place: the FileKind type, the previewable set,
+ *  and the wire-validation allow-list all derive from this. "other" = no
+ *  inline viewer. */
+export const FILE_KINDS = [
+  "text", "code", "pdf", "sheet", "doc", "image", "media", "other",
+] as const;
+export type FileKind = (typeof FILE_KINDS)[number];
 
+/** One manifest row. Deliberately minimal — only what the receiver needs to
+ *  list and gate a file without the bytes — so the manifest stays cheap to send
+ *  for a large folder. `kind` is the sender's classification, re-validated on
+ *  arrival; never trust it blindly (see sanitizeManifest). */
 export interface FileEntry {
   /** Relative path inside the share, '/'-separated, no leading slash. */
   path: string;
@@ -74,15 +99,71 @@ export interface FileEntry {
   kind: FileKind;
 }
 
-export const PREVIEWABLE: ReadonlySet<FileKind> = new Set([
-  "text",
-  "code",
-  "pdf",
-  "sheet",
-  "doc",
-  "image",
-  "media",
-]);
+/** Kinds with an inline viewer — everything except "other". */
+export const PREVIEWABLE: ReadonlySet<FileKind> = new Set(
+  FILE_KINDS.filter((k) => k !== "other"),
+);
+
+const MAX_PATH_LENGTH = 1024;
+const KNOWN_KINDS: ReadonlySet<string> = new Set(FILE_KINDS);
+
+/** Validate an untrusted manifest from the sender; null = protocol violation.
+ *  This is the sole trust boundary on the wire manifest before the receiver
+ *  renders it: it bounds the entry count and, per entry, the path shape (no
+ *  empty or ".." segments, no NUL, length-capped), the size, and the kind. */
+export function sanitizeManifest(value: unknown): FileEntry[] | null {
+  if (!Array.isArray(value) || value.length > MAX_MANIFEST_ENTRIES) return null;
+  const out: FileEntry[] = [];
+  for (const entry of value as FileEntry[]) {
+    if (
+      typeof entry?.path !== "string" ||
+      entry.path.length === 0 ||
+      entry.path.length > MAX_PATH_LENGTH ||
+      // Reject empty segments (leading/trailing/double slash) and "..".
+      entry.path.split("/").some((seg) => seg === "" || seg === "..") ||
+      entry.path.includes("\0") ||
+      !Number.isFinite(entry.size) ||
+      entry.size < 0 ||
+      !KNOWN_KINDS.has(entry.kind)
+    ) {
+      return null;
+    }
+    out.push({ path: entry.path, size: entry.size, kind: entry.kind });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Request policy — the sender's authoritative gates, kept here (pure) so they're
+// testable without a browser; the sender/receiver handlers delegate and stay
+// thin, so the wiring is obvious by inspection. See test/protocol.test.ts.
+// ---------------------------------------------------------------------------
+
+/** Why a granted peer's file request must be refused, or null if it's allowed.
+ *  Downloading needs download/manage; a view link may only fetch previewable
+ *  kinds. Returns the user-facing reason so the handler forwards it as a file-err.
+ *  (Previewing a previewable file is allowed at every level by design.) */
+export function permissionDenial(
+  level: Level,
+  kind: FileKind,
+  intent: "preview" | "download",
+): string | null {
+  if (intent === "download" && !levelAllows(level, "download")) {
+    return "This link is preview-only.";
+  }
+  if (level === "view" && !PREVIEWABLE.has(kind)) {
+    return "This link can only open previewable files.";
+  }
+  return null;
+}
+
+/** A file-head's declared size is attacker-controlled and gates how much the
+ *  receiver buffers, so it must be finite, non-negative, and no larger than the
+ *  size the sanitized manifest already published for that path — otherwise a tiny
+ *  manifest entry could stream gigabytes and OOM the receiving tab. */
+export function validFileHeadSize(size: number, manifestSize: number): boolean {
+  return Number.isFinite(size) && size >= 0 && size <= manifestSize;
+}
 
 // ---------------------------------------------------------------------------
 // Signaling messages (browser <-> relay). The relay only routes; `data` for
@@ -104,6 +185,10 @@ export type ServerToClient =
   | { t: "gone" }
   | { t: "error"; reason: string };
 
+/** One WebRTC handshake message, opaque to the relay. Both fields are optional
+ *  because a frame carries exactly one of them: `desc` for an offer/answer,
+ *  `candidate` for a trickled ICE candidate (null is the spec's end-of-candidates
+ *  marker). The relay forwards the whole object without looking inside. */
 export interface SignalData {
   desc?: RTCSessionDescriptionInit;
   candidate?: RTCIceCandidateInit | null;

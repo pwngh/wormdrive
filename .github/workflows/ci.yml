@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege: CI only reads the repo.
+permissions:
+  contents: read
+
+# A newer push to the same ref cancels the in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Prove the relay + tooling run on every OS, not just Linux (the signaling
+    # smoke spawns the real server, so this exercises it on all three).
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        # test:unit runs `node --experimental-strip-types`, which needs Node
+        # >=22.6. The signaling server itself runs on Node >=20 (plain .mjs, no
+        # type stripping) — that's the engines floor, not the test toolchain's.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      # typecheck + lint + unit tests + signaling smoke (spawns a real relay).
+      - run: npm run check
+      # build the frontend, then exercise the static server's headers/CSP/traversal.
+      - run: npm run build
+      - run: npm run test:headers
+
+  # The two-tab WebRTC e2e needs a real browser, so it runs in its own job with
+  # Chrome installed. Proves connection, transfer, permission gating, destruct,
+  # and the lying-sender disconnect end to end.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+        with:
+          chrome-version: stable
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:e2e
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
