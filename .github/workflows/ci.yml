@@ -54,10 +54,6 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Headless-Chrome WebRTC is environment-fragile in CI. The tamper scenario's
-    # invariant (validFileHeadSize) is also covered deterministically by the unit
-    # suite, so a flaky run here reports as a signal without blocking the pipeline.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

@@ -273,11 +273,18 @@ try {
     throw new Error(`tamper: victim never got the manifest row — connection/grant failed. evil=${JSON.stringify(st)}`, { cause: e });
   }
   await victim.evaluate(clickRow, "f.txt");
+  // The receiver detects the oversized file-head and disconnects immediately, surfacing a
+  // "Disconnected: …" message. Assert from the receiver's side (it acts synchronously)
+  // rather than waiting for the malicious sender to notice the drop: an abrupt WebRTC
+  // teardown only reaches the sender via the slow ICE-disconnect timeout, which can exceed
+  // 20s in headless CI even though the receiver already cut it off (channelClosed/connState
+  // do flip there, just too late to wait on).
   try {
-    await evil.waitForFunction(() => window.__tamper.sentBadHead && window.__tamper.channelClosed, { timeout: 20000 });
+    await evil.waitForFunction(() => window.__tamper.sentBadHead, { timeout: 20000 });
+    await victim.waitForFunction(() => document.body.textContent.includes("Disconnected"), { timeout: 20000 });
   } catch (e) {
     const st = await evil.evaluate(() => window.__tamper).catch(() => null);
-    throw new Error(`tamper: receiver did not disconnect the liar. evil=${JSON.stringify(st)}`, { cause: e });
+    throw new Error(`tamper: receiver did not disconnect after the lie. evil=${JSON.stringify(st)}`, { cause: e });
   }
   ok("receiver disconnected a sender that lied about a file's declared size");
   await victim.close();
