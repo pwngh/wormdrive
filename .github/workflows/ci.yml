@@ -34,7 +34,11 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      - run: npm ci
+      # `npm install`, not `npm ci`: npm records only the host platform's optional
+      # binaries (rollup/esbuild) in package-lock.json, so a lock generated on one OS
+      # makes `npm ci` fail on the others. `npm install` resolves each runner's own
+      # platform binaries from package.json, immune to which OS last wrote the lock.
+      - run: npm install
       # typecheck + lint + unit tests + signaling smoke (spawns a real relay).
       - run: npm run check
       # build the frontend, then exercise the static server's headers/CSP/traversal.
@@ -61,7 +65,7 @@ jobs:
         id: chrome
         with:
           chrome-version: stable
-      - run: npm ci
+      - run: npm install   # see note in the `check` job — robust to a host-only lockfile
       - run: npm run build
       - run: npm run test:e2e
         env:
