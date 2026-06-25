@@ -204,7 +204,7 @@ try {
   await evil.goto(`${ORIGIN}/healthz`);
   await evil.evaluate(
     (wsUrl, shareId) => {
-      window.__tamper = { sentBadHead: false, channelClosed: false };
+      window.__tamper = { sentBadHead: false, channelClosed: false, gotAnswer: false, connState: "new", dcState: "new" };
       const ws = new WebSocket(wsUrl);
       const send = (m) => ws.send(JSON.stringify(m));
       let pc, dc, peerId;
@@ -221,8 +221,15 @@ try {
           pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
           pc.onicecandidate = (e) =>
             send({ t: "signal", to: peerId, data: { candidate: e.candidate ? e.candidate.toJSON() : null } });
+          // Observe the disconnect via BOTH the channel-close event AND the peer-connection
+          // state — an abrupt transport teardown can swallow the dc 'close' in headless CI.
+          pc.onconnectionstatechange = () => {
+            window.__tamper.connState = pc.connectionState;
+            if (["disconnected", "failed", "closed"].includes(pc.connectionState))
+              window.__tamper.channelClosed = true;
+          };
           dc = pc.createDataChannel("wormdrive", { ordered: true });
-          dc.onclose = () => { window.__tamper.channelClosed = true; };
+          dc.onclose = () => { window.__tamper.dcState = "closed"; window.__tamper.channelClosed = true; };
           dc.onmessage = (e) => {
             if (typeof e.data !== "string") return;
             const msg = JSON.parse(e.data);
@@ -240,6 +247,7 @@ try {
         } else if (m.t === "signal") {
           if (m.data.desc) {
             await pc.setRemoteDescription(m.data.desc);
+            window.__tamper.gotAnswer = true;
             // Drain candidates that arrived before the answer: addIceCandidate
             // rejects until a remote description is set, so they were buffered.
             for (const c of pendingIce.splice(0)) await pc.addIceCandidate(c).catch(() => {});
@@ -258,9 +266,19 @@ try {
 
   const victim = await browser.newPage();
   await victim.goto(`${ORIGIN}/#r=${evilShare}&t=${evilToken}`, { waitUntil: "domcontentloaded" });
-  await victim.waitForFunction(hasRow, { timeout: 20000 }, "f.txt");
+  try {
+    await victim.waitForFunction(hasRow, { timeout: 20000 }, "f.txt");
+  } catch (e) {
+    const st = await evil.evaluate(() => window.__tamper).catch(() => null);
+    throw new Error(`tamper: victim never got the manifest row — connection/grant failed. evil=${JSON.stringify(st)}`, { cause: e });
+  }
   await victim.evaluate(clickRow, "f.txt");
-  await evil.waitForFunction(() => window.__tamper.sentBadHead && window.__tamper.channelClosed, { timeout: 20000 });
+  try {
+    await evil.waitForFunction(() => window.__tamper.sentBadHead && window.__tamper.channelClosed, { timeout: 20000 });
+  } catch (e) {
+    const st = await evil.evaluate(() => window.__tamper).catch(() => null);
+    throw new Error(`tamper: receiver did not disconnect the liar. evil=${JSON.stringify(st)}`, { cause: e });
+  }
   ok("receiver disconnected a sender that lied about a file's declared size");
   await victim.close();
   await evil.close();
