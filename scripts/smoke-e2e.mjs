@@ -207,8 +207,11 @@ try {
         const m = JSON.parse(ev.data);
         if (m.t === "peer") {
           peerId = m.peerId;
-          // No STUN: a loopback-only injected peer gathers host candidates only.
-          pc = new RTCPeerConnection({ iceServers: [] });
+          // Use the same ICE config as the real app sender. Host-only candidates don't
+          // pair in headless CI, where Chrome hides loopback IPs behind unresolved mDNS
+          // .local names, so this injected peer must take the STUN-reflexive path the app
+          // connection (checks above) uses to connect.
+          pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
           pc.onicecandidate = (e) =>
             send({ t: "signal", to: peerId, data: { candidate: e.candidate ? e.candidate.toJSON() : null } });
           dc = pc.createDataChannel("wormdrive", { ordered: true });
