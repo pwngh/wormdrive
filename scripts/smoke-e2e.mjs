@@ -93,7 +93,14 @@ try {
   writeFileSync(join(fixtures, "hello.txt"), TEXT);
   writeFileSync(join(fixtures, "secret.bin"), Buffer.from([0, 1, 2, 3, 4, 5, 6, 7]));
   writeFileSync(join(fixtures, "data.csv"), "name,score\nalice,10\nbob,20\n");
-  browser = await puppeteer.launch({ executablePath: CHROME, headless: true, args: ["--no-sandbox"] });
+  // CI hardening for headless-Chrome WebRTC. --disable-dev-shm-usage moves Chrome's
+  // scratch off the tiny /dev/shm on CI runners, which otherwise fills as pages
+  // accumulate and hangs the later connections. The mDNS flag (CI-only, since it
+  // regresses local macOS) exposes real loopback IPs so host ICE candidates pair
+  // instead of hiding behind unresolved .local names.
+  const args = ["--no-sandbox", "--disable-dev-shm-usage"];
+  if (process.env.CI) args.push("--disable-features=WebRtcHideLocalIpsWithMdns");
+  browser = await puppeteer.launch({ executablePath: CHROME, headless: true, args });
 } catch (err) {
   cleanup();
   console.error(`FAIL: ${err.message}`);
