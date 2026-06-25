@@ -34,10 +34,13 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-      # `npm install`, not `npm ci`: npm records only the host platform's optional
-      # binaries (rollup/esbuild) in package-lock.json, so a lock generated on one OS
-      # makes `npm ci` fail on the others. `npm install` resolves each runner's own
-      # platform binaries from package.json, immune to which OS last wrote the lock.
+      # The committed lockfile only carries the host OS's optional binaries (rollup/esbuild),
+      # and npm mishandles that cross-platform (npm/cli#4828) — differently across npm
+      # versions. Delete the lockfile so npm resolves each runner's own platform binaries
+      # fresh from package.json (the workaround the error itself recommends): immune to npm
+      # version, OS, and whichever machine last wrote the lock.
+      - run: rm -f package-lock.json
+        shell: bash
       - run: npm install
       # typecheck + lint + unit tests + signaling smoke (spawns a real relay).
       - run: npm run check
@@ -65,7 +68,9 @@ jobs:
         id: chrome
         with:
           chrome-version: stable
-      - run: npm install   # see note in the `check` job — robust to a host-only lockfile
+      - run: rm -f package-lock.json   # drop the host-only lockfile — see `check` note (npm/cli#4828)
+        shell: bash
+      - run: npm install
       - run: npm run build
       - run: npm run test:e2e
         env:
