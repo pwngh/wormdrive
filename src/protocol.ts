@@ -25,6 +25,18 @@ export const CHUNK_SIZE = 64 * 1024;
 export const BUFFER_HIGH = 4 * 1024 * 1024;
 export const BUFFER_LOW = 1 * 1024 * 1024;
 
+/** Application-level flow control for downloads. The transport acknowledges bytes
+ *  when they reach the receiving tab, not when they reach its disk — so a download
+ *  streamed to a slow disk would let chunks pile up in the tab's memory with no way
+ *  to slow the sender. Fix: the receiver acks the bytes it has actually consumed
+ *  (every ACK_INTERVAL), and the sender runs at most FLOW_WINDOW ahead of those
+ *  acks, which bounds the receiver's in-flight memory to roughly one window.
+ *  FLOW_STALL_MS gives up on a receiver that stops acking entirely (a wedged disk),
+ *  so a transfer can't pin the channel open forever. */
+export const FLOW_WINDOW = 8 * 1024 * 1024;
+export const ACK_INTERVAL = 1 * 1024 * 1024;
+export const FLOW_STALL_MS = 30_000;
+
 /** Text previews are capped so a giant log can't lock the tab. */
 export const TEXT_PREVIEW_CAP = 1.5 * 1024 * 1024;
 
@@ -110,7 +122,8 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set(FILE_KINDS);
 /** Validate an untrusted manifest from the sender; null = protocol violation.
  *  This is the sole trust boundary on the wire manifest before the receiver
  *  renders it: it bounds the entry count and, per entry, the path shape (no
- *  empty or ".." segments, no NUL, length-capped), the size, and the kind. */
+ *  empty or ".." segments, no backslashes or control bytes, length-capped), the
+ *  size, and the kind. */
 export function sanitizeManifest(value: unknown): FileEntry[] | null {
   if (!Array.isArray(value) || value.length > MAX_MANIFEST_ENTRIES) return null;
   const out: FileEntry[] = [];
@@ -121,7 +134,13 @@ export function sanitizeManifest(value: unknown): FileEntry[] | null {
       entry.path.length > MAX_PATH_LENGTH ||
       // Reject empty segments (leading/trailing/double slash) and "..".
       entry.path.split("/").some((seg) => seg === "" || seg === "..") ||
-      entry.path.includes("\0") ||
+      // Backslashes and control bytes (NUL included). A receiver that streams the
+      // manifest into a zip would otherwise let a path like "a\\..\\evil" — no "/",
+      // so the segment check above misses it — escape the extraction directory on
+      // Windows (zip-slip); control bytes also corrupt names and the save dialog.
+      entry.path.includes("\\") ||
+      // eslint-disable-next-line no-control-regex
+      /[\x00-\x1f\x7f]/.test(entry.path) ||
       !Number.isFinite(entry.size) ||
       entry.size < 0 ||
       !KNOWN_KINDS.has(entry.kind)
@@ -165,6 +184,14 @@ export function validFileHeadSize(size: number, manifestSize: number): boolean {
   return Number.isFinite(size) && size >= 0 && size <= manifestSize;
 }
 
+/** Sender flow-control gate: true once the sender has run a full FLOW_WINDOW ahead
+ *  of the bytes the receiver reports having consumed, so it must wait for the next
+ *  ack before sending more. This is what keeps a slow receiver disk from inflating
+ *  the receiver's in-flight memory during a streamed download. */
+export function creditExhausted(sent: number, acked: number): boolean {
+  return sent - acked >= FLOW_WINDOW;
+}
+
 // ---------------------------------------------------------------------------
 // Signaling messages (browser <-> relay). The relay only routes; `data` for
 // "signal" is opaque to it.
@@ -201,8 +228,14 @@ export interface SignalData {
 // ---------------------------------------------------------------------------
 
 export type ReceiverToSender =
-  | { t: "hello"; token: string }
+  // `flow` advertises that this receiver speaks the ack-based flow control below.
+  // An older receiver omits it; the sender then streams without the credit gate
+  // (its old behavior), so the two stay compatible across a deploy.
+  | { t: "hello"; token: string; flow?: boolean }
   | { t: "get"; id: number; path: string; intent: "preview" | "download" }
+  // Cumulative bytes the receiver has consumed (written/buffered) for transfer
+  // `id` — the sender's credit signal. See creditExhausted / FLOW_WINDOW.
+  | { t: "ack"; id: number; bytes: number }
   | { t: "destroy" };
 
 export type SenderToReceiver =

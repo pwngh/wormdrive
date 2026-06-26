@@ -19,6 +19,8 @@ import {
   sanitizeManifest,
   permissionDenial,
   validFileHeadSize,
+  creditExhausted,
+  FLOW_WINDOW,
   PREVIEWABLE,
   FILE_KINDS,
 } from "../src/protocol.ts";
@@ -60,6 +62,14 @@ test("sanitizeManifest: rejects non-arrays", () => {
 test("sanitizeManifest: rejects traversal, absolute, and empty segments", () => {
   for (const path of ["../etc/passwd", "a/../b", "a//b", "/abs", "trailing/", ""]) {
     assert.equal(sanitizeManifest([entry({ path })]), null, path);
+  }
+});
+
+test("sanitizeManifest: rejects backslashes and control bytes (zip-slip surface)", () => {
+  // Streamed into a zip, a backslash path like "a\\..\\evil" has no "/" so the
+  // segment check misses it — it must be rejected here, along with control bytes.
+  for (const path of ["a\\..\\evil", "C:\\Windows\\x", "a\\b", `a${NUL}b`, "tab\tname", "del\x7fname"]) {
+    assert.equal(sanitizeManifest([entry({ path })]), null, JSON.stringify(path));
   }
 });
 
@@ -112,4 +122,13 @@ test("validFileHeadSize: accepts 0..manifestSize, rejects over / negative / non-
   assert.equal(validFileHeadSize(-1, 10), false);
   assert.equal(validFileHeadSize(Number.NaN, 10), false);
   assert.equal(validFileHeadSize(Number.POSITIVE_INFINITY, 10), false);
+});
+
+test("creditExhausted: makes the sender wait once a full window is unacked", () => {
+  assert.equal(creditExhausted(0, 0), false);
+  assert.equal(creditExhausted(FLOW_WINDOW - 1, 0), false, "just under a window: keep sending");
+  assert.equal(creditExhausted(FLOW_WINDOW, 0), true, "exactly a window outstanding: wait");
+  assert.equal(creditExhausted(FLOW_WINDOW + 100, 100), true, "a full window outstanding: wait");
+  assert.equal(creditExhausted(FLOW_WINDOW + 100, 200), false, "an ack opened room: resume");
+  assert.equal(creditExhausted(0, 100), false, "a bogus over-ack (acked > sent) only frees credit, never blocks");
 });

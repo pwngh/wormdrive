@@ -19,10 +19,12 @@ import { icon, kindIcon } from "./icons";
 import { classify, toManifest } from "./manifest";
 import {
   CHUNK_SIZE,
+  FLOW_STALL_MS,
   LEVELS,
   LEVEL_BLURB,
   LEVEL_LABEL,
   MAX_MANIFEST_ENTRIES,
+  creditExhausted,
   levelAllows,
   permissionDenial,
   type Level,
@@ -31,6 +33,14 @@ import {
 } from "./protocol";
 import { offerPeer, sendWithBackpressure, type Peer } from "./rtc";
 import { Signal } from "./signaling";
+
+// Per-transfer credit state, live only while serving a file (see the flow-control
+// note in protocol.ts). `id` ties acks to the active transfer; fields are inline.
+interface Flow {
+  id: number;
+  acked: number; // bytes the receiver reports having consumed for the active transfer
+  waiter: (() => void) | null; // wakes serveFile when a fresh ack may free credit
+}
 
 // Per-peer connection state. `dc` is null until the data channel opens, `level`
 // is null until the peer presents a valid token in its `hello` — both gates are
@@ -43,6 +53,10 @@ interface PeerCtx {
   dc: RTCDataChannel | null;
   level: Level | null;
   busy: boolean;
+  // Whether this receiver advertised ack-based flow control in its `hello`.
+  flowControl: boolean;
+  // Per-transfer credit state while serving a file; null between transfers.
+  flow: Flow | null;
 }
 
 // A file the user has queued, paired with its share-relative path. `path` is the
@@ -196,12 +210,15 @@ export function mountSender(root: HTMLElement): void {
       // Mirror the receiver's manifest path-shape validation (sanitizeManifest in
       // protocol.ts) so an honest folder doesn't build a manifest the receiver
       // rejects and disconnects on. The receiver caps path length at 1024 and
-      // rejects NUL bytes, so a single offending entry would void the whole
-      // manifest there; skip it here too rather than serve a share that dies.
+      // rejects backslashes and control bytes, so a single offending entry would
+      // void the whole manifest there; skip it here too rather than serve a share
+      // that dies.
       if (
         clean.length === 0 ||
         clean.length > 1024 ||
-        clean.includes("\0") ||
+        clean.includes("\\") ||
+        // eslint-disable-next-line no-control-regex
+        /[\x00-\x1f\x7f]/.test(clean) ||
         clean.split("/").some((seg) => seg === "" || seg === "..")
       )
         continue;
@@ -427,7 +444,7 @@ export function mountSender(root: HTMLElement): void {
   function acceptPeer(peerId: string): void {
     if (!signal || peers.has(peerId)) return;
     const peer = offerPeer(signal, peerId);
-    const ctx: PeerCtx = { id: peerId, peer, dc: null, level: null, busy: false };
+    const ctx: PeerCtx = { id: peerId, peer, dc: null, level: null, busy: false, flowControl: false, flow: null };
     peers.set(peerId, ctx);
     renderPeers();
 
@@ -487,6 +504,7 @@ export function mountSender(root: HTMLElement): void {
         return;
       }
       ctx.level = granted;
+      ctx.flowControl = msg.flow === true;
       sendCtl(ctx, {
         t: "grant",
         level: granted,
@@ -524,6 +542,18 @@ export function mountSender(root: HTMLElement): void {
       return;
     }
 
+    if (msg.t === "ack") {
+      // Credit from the receiver: advance the active transfer's acked count and
+      // wake serveFile if it was parked waiting for room. Ignore stale acks (a
+      // different/finished transfer) and any that don't move the count forward.
+      const flow = ctx.flow;
+      if (flow && msg.id === flow.id && typeof msg.bytes === "number" && Number.isFinite(msg.bytes) && msg.bytes > flow.acked) {
+        flow.acked = msg.bytes;
+        flow.waiter?.();
+      }
+      return;
+    }
+
     if (msg.t === "destroy") {
       if (levelAllows(ctx.level, "destroy")) destroyShare("Destroyed remotely by a Manager link.");
       else sendCtl(ctx, { t: "deny", reason: "This link cannot destroy the share." });
@@ -534,7 +564,11 @@ export function mountSender(root: HTMLElement): void {
     const dc = ctx.dc;
     if (!dc || dc.readyState !== "open") return;
     sendCtl(ctx, { t: "file-head", id, path, size: file.size, mime: file.type || "application/octet-stream" });
+    // Credit state for this transfer, enforced only if the receiver asked for it.
+    const flow: Flow | null = ctx.flowControl ? { id, acked: 0, waiter: null } : null;
+    ctx.flow = flow;
     try {
+      let sent = 0;
       for (let offset = 0; offset < file.size; offset += CHUNK_SIZE) {
         // Re-check ownership every chunk, not just at the start: a transfer can
         // span seconds, and the user may remove or replace this path mid-stream.
@@ -544,13 +578,61 @@ export function mountSender(root: HTMLElement): void {
           sendCtl(ctx, { t: "file-err", id, reason: "Transfer stopped — the file was destroyed." });
           return;
         }
+        // Stay within a window of the bytes the receiver has actually consumed.
+        // sendWithBackpressure only watches the transport buffer, which empties as
+        // soon as bytes reach the far tab — not when they reach its disk — so this
+        // is the only thing that throttles a sender racing a slow receiver disk.
+        if (flow) await awaitCredit(dc, flow, sent);
         const chunk = await file.slice(offset, offset + CHUNK_SIZE).arrayBuffer();
         await sendWithBackpressure(dc, chunk);
+        sent += chunk.byteLength;
       }
       sendCtl(ctx, { t: "file-eof", id });
     } catch {
-      // channel died mid-transfer; peer cleanup happens via onclose
+      // Reached when the channel died (sendWithBackpressure / awaitCredit saw a
+      // close or error) or the receiver stalled past FLOW_STALL_MS. A stall does
+      // NOT close the channel, so the receiver's onclose never fires and it would
+      // wait forever on a transfer that never ends — tell it to fail and drain.
+      // sendCtl is a no-op on a closed channel, so the channel-death case is
+      // unaffected; the file-changed case returned earlier with its own file-err.
+      sendCtl(ctx, { t: "file-err", id, reason: "Transfer stalled — no acknowledgment from the receiver." });
+    } finally {
+      ctx.flow = null;
     }
+  }
+
+  // Park until the receiver's acks free up credit (resolve), the channel closes,
+  // or the receiver goes silent for FLOW_STALL_MS (reject — a wedged receiver must
+  // not pin a transfer open). The ack handler calls flow.waiter on each advance.
+  function awaitCredit(dc: RTCDataChannel, flow: Flow, sent: number): Promise<void> {
+    // Clamp acked to what we've actually sent: an honest receiver can't consume
+    // more than it was sent, and clamping keeps a bogus over-ack from driving the
+    // subtraction negative and permanently disabling the window.
+    if (!creditExhausted(sent, Math.min(flow.acked, sent))) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const timer = window.setTimeout(() => {
+        cleanup();
+        reject(new Error("receiver stalled"));
+      }, FLOW_STALL_MS);
+      const onClose = () => {
+        cleanup();
+        reject(new Error("channel closed"));
+      };
+      const cleanup = () => {
+        window.clearTimeout(timer);
+        flow.waiter = null;
+        dc.removeEventListener("close", onClose);
+        dc.removeEventListener("error", onClose);
+      };
+      flow.waiter = () => {
+        if (!creditExhausted(sent, Math.min(flow.acked, sent))) {
+          cleanup();
+          resolve();
+        }
+      };
+      dc.addEventListener("close", onClose);
+      dc.addEventListener("error", onClose);
+    });
   }
 
   function broadcastManifest(): void {

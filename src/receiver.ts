@@ -25,7 +25,9 @@ import { warpBurst } from "./fx/starfield";
 import { icon, kindIcon } from "./icons";
 import { basename, crumbs, listDir, type Row } from "./manifest";
 import {
+  ACK_INTERVAL,
   CHUNK_SIZE,
+  FLOW_STALL_MS,
   LEVEL_BLURB,
   LEVEL_LABEL,
   LEVELS,
@@ -41,6 +43,7 @@ import {
 import { answerPeer } from "./rtc";
 import { Signal } from "./signaling";
 import { renderPreview, releasePreviewResources } from "./viewers";
+import { createZip, ZipStream, type ZipEntry, type ZipWrite } from "./zip";
 
 interface Transfer {
   id: number;
@@ -48,7 +51,14 @@ interface Transfer {
   expected: number;
   mime: string;
   chunks: ArrayBuffer[];
+  /** When set, byte chunks are written here (streamed to disk) instead of being
+   *  buffered in `chunks`. The transfer `id` is passed through so the sink can ack. */
+  sink?: (chunk: ArrayBuffer, id: number) => void;
   received: number;
+  // Bytes consumed and the high-water mark already acked to the sender (buffered
+  // path only; the streaming sink tracks its own). See ACK_INTERVAL / sendAck.
+  consumed: number;
+  lastAck: number;
   onProgress: (received: number, expected: number) => void;
   resolve: (result: FetchResult) => void;
   reject: (err: Error) => void;
@@ -66,6 +76,8 @@ interface QueueItem {
   intent: "preview" | "download";
   priority: Priority;
   onProgress: Transfer["onProgress"];
+  /** Streaming sink; when present the bytes go here instead of a buffered Blob. */
+  sink?: (chunk: ArrayBuffer, id: number) => void;
   resolve: (result: FetchResult) => void;
   reject: (err: Error) => void;
 }
@@ -80,6 +92,12 @@ const PREFETCH_SCAN_COUNT = 24;
 
 // Timings (ms).
 const STALL_TIMEOUT_MS = 20_000; // drop the "connecting…" state after this with NAT advice
+// In-transfer liveness watchdog. Longer than the sender's FLOW_STALL_MS so a
+// healthy slow-disk download (which legitimately pauses the sender for credit) is
+// never aborted — bytes resume and re-arm this, or the sender's own stall fires
+// first and sends file-err. Only a sender that goes silent without closing the
+// channel (a suspended tab, a half-open path) trips it.
+const TRANSFER_STALL_MS = FLOW_STALL_MS + 15_000;
 const HOVER_PREFETCH_MS = 120; // hover dwell before speculatively warming a file
 const IDLE_CALLBACK_TIMEOUT_MS = 800; // requestIdleCallback deadline for prefetch work
 const IDLE_FALLBACK_MS = 180; // setTimeout fallback where requestIdleCallback is absent
@@ -111,6 +129,10 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   let cwd = "";
   let nextId = 1;
   let inflight: Transfer | null = null;
+  let xferTimer = 0; // in-transfer liveness watchdog; armed only while a transfer is inflight
+  // Streamed eofs resolve with a value their resolver ignores (the bytes are on
+  // disk); reuse one empty result instead of allocating a Blob per eof.
+  const EMPTY_RESULT: FetchResult = { blob: new Blob([]), mime: "" };
   let ended = false;
 
   // explorer state
@@ -132,6 +154,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
 
   // viewer state
   let overlayOpen = false;
+  let downloading = false;
 
   // ----- skeleton ----------------------------------------------------------
   const ring = el("span", { class: "ring connecting", title: "connection state" });
@@ -155,9 +178,12 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   const sortNameBtn = el("button", { class: "sortbtn mono", "aria-label": "Sort by name" }, ["name"]);
   const sortSizeBtn = el("button", { class: "sortbtn mono", "aria-label": "Sort by size" }, ["size"]);
   const countLabel = el("span", { class: "mono dim count" });
+  // Bulk download (download/manage links only): the whole current folder as a zip,
+  // or a lone file directly. Revealed and labelled in renderBrowser once a grant lands.
+  const downloadAllBtn = el("button", { class: "btn small", hidden: true });
   const toolbar = el("div", { class: "toolbar", hidden: true }, [
     el("div", { class: "searchwrap" }, [icon("search"), searchInput]),
-    el("div", { class: "row gap center" }, [sortNameBtn, sortSizeBtn, countLabel]),
+    el("div", { class: "row gap center" }, [sortNameBtn, sortSizeBtn, countLabel, downloadAllBtn]),
   ]);
 
   const crumbBar = el("nav", { class: "crumbs mono", "aria-label": "Breadcrumb" });
@@ -224,7 +250,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       channel.onclose = () => {
         if (!ended) fail("The sender went offline. This share has ended.");
       };
-      channel.send(JSON.stringify({ t: "hello", token }));
+      channel.send(JSON.stringify({ t: "hello", token, flow: true }));
     })
     .catch(() => fail("Peer connection failed."));
 
@@ -276,16 +302,33 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       return;
     }
     if (raw instanceof ArrayBuffer && inflight) {
-      inflight.chunks.push(raw);
       inflight.received += raw.byteLength;
-      // Hard ceiling: never buffer past the declared size (+ one chunk of
+      // Hard ceiling: never accept past the declared size (+ one chunk of
       // slack). Catches both lying file-heads and chunks sent with no head
-      // at all (expected is still 0 then).
+      // at all (expected is still 0 then). Checked before the chunk is kept,
+      // so nothing over-limit is buffered or written to disk.
       if (inflight.received > inflight.expected + CHUNK_SIZE) {
         violation("transfer exceeded its declared size.");
         return;
       }
+      if (inflight.sink) {
+        inflight.sink(raw, inflight.id);
+      } else {
+        inflight.chunks.push(raw);
+        // Buffered chunks count as consumed the instant they land in memory (no
+        // disk to wait on), so acks keep pace with arrival and the sender never
+        // throttles this path (it's holding the whole file anyway). The streaming
+        // sink instead advances consumed only after each disk write resolves, so
+        // its acks lag a slow disk — and that lag is what paces the download. Both
+        // paths ack every ACK_INTERVAL; only when a byte counts as consumed differs.
+        inflight.consumed += raw.byteLength;
+        if (inflight.consumed - inflight.lastAck >= ACK_INTERVAL) {
+          inflight.lastAck = inflight.consumed;
+          sendAck(inflight.id, inflight.consumed);
+        }
+      }
       inflight.onProgress(inflight.received, inflight.expected);
+      armXferTimer(); // bytes arrived: the transfer is alive, restart the watchdog
     }
   }
 
@@ -346,27 +389,37 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       }
       case "file-head":
         if (inflight && inflight.id === msg.id) {
+          const cur = inflight; // narrowed const keeps its non-null type inside find()
+          armXferTimer(); // the sender responded; the transfer is alive
           // The declared size is attacker-controlled and gates how much we
           // buffer (see the ArrayBuffer ceiling), so it must not exceed what
           // the validated manifest promised for this path — otherwise a tiny
           // manifest entry could stream gigabytes and OOM the tab.
-          const entry = manifest.find((e) => e.path === inflight!.path);
+          const entry = manifest.find((e) => e.path === cur.path);
           if (!entry || !validFileHeadSize(msg.size, entry.size)) {
             violation("file-head disagrees with the manifest.");
             return;
           }
-          inflight.expected = msg.size;
-          inflight.mime = typeof msg.mime === "string" ? msg.mime.slice(0, 200) : "";
+          cur.expected = msg.size;
+          cur.mime = typeof msg.mime === "string" ? msg.mime.slice(0, 200) : "";
         }
         break;
       case "file-eof":
         if (inflight && inflight.id === msg.id) {
           const done = inflight;
           inflight = null;
-          const result = { blob: new Blob(done.chunks, { type: done.mime }), mime: done.mime };
-          cacheResult(done.path, result);
-          pending.delete(done.path);
-          done.resolve(result);
+          clearXferTimer();
+          if (done.sink) {
+            // Streamed straight to the sink — nothing buffered to wrap or cache,
+            // and a streamed transfer is never tracked in `pending`. The resolver
+            // ignores the value (bytes are on disk), so reuse EMPTY_RESULT.
+            done.resolve(EMPTY_RESULT);
+          } else {
+            const result = { blob: new Blob(done.chunks, { type: done.mime }), mime: done.mime };
+            cacheResult(done.path, result);
+            pending.delete(done.path);
+            done.resolve(result);
+          }
           drain();
         }
         break;
@@ -374,7 +427,8 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
         if (inflight && inflight.id === msg.id) {
           const dead = inflight;
           inflight = null;
-          pending.delete(dead.path);
+          clearXferTimer();
+          if (!dead.sink) pending.delete(dead.path); // streamed transfers aren't in `pending`
           dead.reject(new Error(msg.reason));
           drain();
         }
@@ -453,16 +507,119 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       expected: 0,
       mime: "",
       chunks: [],
+      sink: item.sink,
       received: 0,
+      consumed: 0,
+      lastAck: 0,
       onProgress: item.onProgress,
       resolve: item.resolve,
       reject: item.reject,
     };
     dc.send(JSON.stringify({ t: "get", id, path: item.path, intent: item.intent }));
+    armXferTimer();
+  }
+
+  // Fail an in-flight transfer whose sender has gone quiet — no bytes, no file-eof,
+  // no file-err, no channel close — so it can't pin `inflight` and wedge the queue.
+  // Armed when a transfer starts, re-armed on each byte, cleared on settlement.
+  function armXferTimer(): void {
+    window.clearTimeout(xferTimer);
+    xferTimer = window.setTimeout(() => {
+      if (!inflight) return;
+      const dead = inflight;
+      inflight = null;
+      if (!dead.sink) pending.delete(dead.path);
+      dead.reject(new Error("Transfer stalled — the sender stopped responding."));
+      drain();
+    }, TRANSFER_STALL_MS);
+  }
+
+  function clearXferTimer(): void {
+    window.clearTimeout(xferTimer);
+    xferTimer = 0;
+  }
+
+  // Tell the sender how many bytes we've consumed for transfer `id` — its credit
+  // to send more (see FLOW_WINDOW). Best-effort: a closed channel needs no ack.
+  function sendAck(id: number, bytes: number): void {
+    if (dc && dc.readyState === "open") dc.send(JSON.stringify({ t: "ack", id, bytes }));
+  }
+
+  /**
+   * Stream a file's bytes straight to `write` (e.g. a disk writable) instead of
+   * buffering them into a Blob, so a large file passes through rather than being
+   * held whole. We ack progress as chunks land on disk (roughly every ACK_INTERVAL,
+   * not per chunk), and the sender will not run more than FLOW_WINDOW ahead of those
+   * acks, so the bytes waiting here stay bounded even when the disk is slower than
+   * the link. Goes through the same queue
+   * and the same sender-side permission gate as a buffered download — only the
+   * destination differs. Not cached (a streamed file may dwarf the cache budget).
+   * Resolves once the last byte has been written.
+   */
+  function streamFile(path: string, write: ZipWrite): Promise<void> {
+    if (!dc || dc.readyState !== "open" || ended) {
+      return Promise.reject(new Error("Not connected."));
+    }
+    return new Promise<void>((resolve, reject) => {
+      // Chunks arrive in order; the disk write is async, so we feed them to disk
+      // one at a time down a promise chain (each waits for the one before it). Once
+      // a chunk lands we tell the sender how far we've gotten — an ack every
+      // ACK_INTERVAL — which frees it to send more. That ack is the brake: without
+      // it the sender would outrun a slow disk and the unwritten chunks would pile
+      // up here. eof resolves once the chain drains (the last byte is on disk).
+      let chain: Promise<void> = Promise.resolve();
+      let consumed = 0;
+      let lastAck = 0;
+      const sink = (chunk: ArrayBuffer, id: number): void => {
+        const len = chunk.byteLength;
+        chain = chain
+          .then(() => write(new Uint8Array(chunk)))
+          .then(() => {
+            consumed += len;
+            if (consumed - lastAck >= ACK_INTERVAL) {
+              lastAck = consumed;
+              sendAck(id, consumed);
+            }
+          });
+        // If a disk write fails (quota, the device removed, an I/O error), surface
+        // it: tear this transfer down so the outer promise rejects, inflight clears,
+        // and drain() resumes the queue — otherwise acks would freeze, the sender
+        // would stall, and the whole transfer engine would wedge. Guard on still
+        // being the active transfer so a write that rejects after an unrelated
+        // teardown can't fail a later one. (This also consumes the trailing
+        // rejection, which is why a bare .catch was here before.)
+        chain.catch((err) => {
+          if (inflight && inflight.id === id) {
+            const dead = inflight;
+            inflight = null;
+            clearXferTimer();
+            dead.reject(err instanceof Error ? err : new Error("Disk write failed."));
+            drain();
+          }
+        });
+      };
+      const item: QueueItem = {
+        path,
+        intent: "download",
+        priority: "user",
+        onProgress: noProgress,
+        sink,
+        resolve: () => {
+          void chain.then(() => resolve(), reject);
+        },
+        reject,
+      };
+      // User priority: ahead of speculative pulls, behind earlier user requests.
+      const at = queue.findIndex((q) => q.priority === "idle");
+      if (at === -1) queue.push(item);
+      else queue.splice(at, 0, item);
+      drain();
+    });
   }
 
   function rejectAll(reason: string): void {
     const err = new Error(reason);
+    clearXferTimer();
     inflight?.reject(err);
     inflight = null;
     for (const item of queue) item.reject(err);
@@ -488,7 +645,9 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     if (!old) return;
     blobCache.delete(path);
     cacheBytes -= old.blob.size;
-    refreshCacheDots();
+    // No refreshCacheDots() here: cacheResult refreshes once after its eviction
+    // loop, and the manifest handler refreshes via renderBrowser — a per-drop
+    // refresh was a redundant pass over cacheDots.
   }
 
   function refreshCacheDots(): void {
@@ -499,7 +658,9 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   function schedulePrefetch(): void {
     const token = ++prefetchToken;
     idle(() => {
-      if (token !== prefetchToken || ended || !level) return;
+      // Skip while a bulk download runs: a streamed transfer isn't tracked in
+      // `pending`, so a speculative pull for the same path wouldn't dedupe.
+      if (token !== prefetchToken || ended || !level || downloading) return;
       let budget = PREFETCH_SCAN_COUNT;
       for (const row of currentRows) {
         if (budget === 0) break;
@@ -576,6 +737,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       const bytes = currentRows.reduce((n, r) => n + (r.type === "dir" ? r.size : r.entry.size), 0);
       countLabel.textContent = `${dirs} dir · ${files} file${files === 1 ? "" : "s"} · ${fmtSize(bytes)}`;
     }
+    updateDownloadAll();
 
     table.replaceChildren();
     cacheDots.clear();
@@ -604,6 +766,155 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     schedulePrefetch();
   }
 
+  // ----- bulk download -----------------------------------------------------
+  // What the download button acts on: the filtered matches when a filter is
+  // active, otherwise every file under the current folder (recursively). The
+  // prefix is stripped from zip entry names so the archive is rooted at the
+  // folder you're in (full paths at root, full paths for cross-folder matches).
+  function downloadScope(): { files: FileEntry[]; prefix: string; filtered: boolean } {
+    if (filterText) {
+      return { files: currentRows.flatMap((r) => (r.type === "file" ? [r.entry] : [])), prefix: "", filtered: true };
+    }
+    const files = manifest.filter((e) => cwd === "" || e.path.startsWith(`${cwd}/`));
+    return { files, prefix: cwd === "" ? "" : `${cwd}/`, filtered: false };
+  }
+
+  function updateDownloadAll(): void {
+    if (!level || !levelAllows(level, "download")) {
+      downloadAllBtn.hidden = true;
+      return;
+    }
+    const { files, filtered } = downloadScope();
+    downloadAllBtn.hidden = files.length === 0;
+    if (files.length === 0) return;
+    downloadAllBtn.disabled = downloading;
+    // While a download runs, runDownload's setLabel owns the button text (the live
+    // progress). Don't overwrite it with the idle/new-scope label; runDownload's
+    // finally repaints this once downloading clears.
+    if (downloading) return;
+    const total = files.reduce((sum, e) => sum + e.size, 0);
+    downloadAllBtn.replaceChildren(
+      icon("download"),
+      files.length === 1
+        ? `Download ${basename(files[0]!.path)}`
+        : `Download ${filtered ? "matches" : "all"} (${files.length}) · ${fmtSize(total)}`,
+    );
+  }
+
+  // The download button streams straight to disk when the browser has the File
+  // System Access API (so a multi-gigabyte folder uses ~one chunk of memory while
+  // the disk keeps pace with the wire), and otherwise assembles the download in
+  // memory and saves it (fine for the everyday case, bounded by the tab's memory).
+  // Either way every file is fetched through the same sender-side permission gate
+  // as a single download.
+
+  // Minimal slice of the File System Access API we use (absent from some TS DOM libs).
+  interface DiskWritable {
+    write(chunk: Uint8Array): Promise<void>;
+    close(): Promise<void>;
+    abort(): Promise<void>;
+  }
+  type SaveFilePicker = (opts: { suggestedName?: string }) => Promise<{ createWritable(): Promise<DiskWritable> }>;
+
+  function savePicker(): SaveFilePicker | undefined {
+    return (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
+  }
+
+  /** Archive name for a folder/filtered download (a lone file keeps its own name). */
+  function zipStem(filtered: boolean): string {
+    if (filtered) return "wormdrive-files";
+    if (cwd === "") return title.textContent || "wormdrive";
+    return basename(cwd);
+  }
+
+  async function runDownload(): Promise<void> {
+    if (downloading || !level || !levelAllows(level, "download")) return;
+    const { files, prefix, filtered } = downloadScope();
+    if (files.length === 0) return;
+    downloading = true;
+    downloadAllBtn.disabled = true;
+    const setLabel = (text: string): void => {
+      downloadAllBtn.replaceChildren(text);
+    };
+    const picker = savePicker();
+    try {
+      if (picker) await streamToDisk(picker, files, prefix, filtered, setLabel);
+      else await bundleInMemory(files, prefix, filtered, setLabel);
+    } catch (err) {
+      // A dismissed save dialog isn't a failure; anything else is worth showing
+      // (unless a disconnect already replaced the message).
+      if ((err as DOMException).name !== "AbortError" && !ended) {
+        message.hidden = false;
+        message.textContent = `Download failed: ${(err as Error).message}`;
+      }
+    } finally {
+      downloading = false;
+      if (!ended) updateDownloadAll();
+    }
+  }
+
+  // Stream to disk: a lone file goes byte-for-byte to the chosen file; a folder is
+  // streamed into a zip on the fly. Peak memory is ~one chunk while the disk keeps
+  // pace with the wire, not the whole set.
+  async function streamToDisk(
+    picker: SaveFilePicker,
+    files: FileEntry[],
+    prefix: string,
+    filtered: boolean,
+    setLabel: (text: string) => void,
+  ): Promise<void> {
+    const single = files.length === 1;
+    const suggestedName = single ? safeName(basename(files[0]!.path)) : safeName(`${zipStem(filtered)}.zip`);
+    const handle = await picker({ suggestedName });
+    const writable = await handle.createWritable();
+    try {
+      if (single) {
+        setLabel("Downloading…");
+        await streamFile(files[0]!.path, (chunk) => writable.write(chunk));
+      } else {
+        const zip = new ZipStream((chunk) => writable.write(chunk));
+        for (let i = 0; i < files.length; i += 1) {
+          setLabel(`Downloading ${i + 1}/${files.length}…`);
+          const file = files[i]!;
+          await zip.addFile(file.path.slice(prefix.length), file.size);
+          await streamFile(file.path, (chunk) => zip.writeChunk(chunk));
+          await zip.closeFile();
+        }
+        await zip.finish();
+      }
+      await writable.close();
+    } catch (err) {
+      await writable.abort().catch(() => undefined); // discard the partial file
+      throw err;
+    }
+  }
+
+  // In-memory fallback (no File System Access API): a lone file downloads directly;
+  // a folder is bundled into one store-only zip and saved.
+  async function bundleInMemory(
+    files: FileEntry[],
+    prefix: string,
+    filtered: boolean,
+    setLabel: (text: string) => void,
+  ): Promise<void> {
+    if (files.length === 1) {
+      setLabel("Downloading…");
+      const { blob } = await requestFile(files[0]!.path, "download", "user");
+      saveBlob(blob, basename(files[0]!.path));
+      return;
+    }
+    const entries: ZipEntry[] = [];
+    for (let i = 0; i < files.length; i += 1) {
+      setLabel(`Zipping ${i + 1}/${files.length}…`);
+      const file = files[i]!;
+      const { blob } = await requestFile(file.path, "download", "user");
+      entries.push({ name: file.path.slice(prefix.length), data: new Uint8Array(await blob.arrayBuffer()) });
+    }
+    saveBlob(new Blob([createZip(entries)], { type: "application/zip" }), `${zipStem(filtered)}.zip`);
+  }
+
+  downloadAllBtn.addEventListener("click", () => void runDownload());
+
   function applySelection(scroll = true): void {
     rowNodes.forEach((node, i) => node.classList.toggle("selected", i === selected));
     const row = selected >= 0 ? currentRows[selected] : undefined;
@@ -622,6 +933,10 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
     }
     const previewable = PREVIEWABLE.has(row.entry.kind);
     if (level === "view" && !previewable) return;
+    // A bulk download owns the channel; opening a preview now would re-fetch a path
+    // it may be streaming (streamed transfers aren't in `pending`, so the request
+    // wouldn't dedupe). Folder navigation above stays available.
+    if (downloading) return;
     const list = currentRows
       .filter((r): r is Extract<Row, { type: "file" }> => r.type === "file")
       .filter((r) => level !== "view" || PREVIEWABLE.has(r.entry.kind))
@@ -675,7 +990,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
       let hover = 0;
       node.addEventListener("mouseenter", () => {
         hover = window.setTimeout(() => {
-          if (ended || !PREVIEWABLE.has(entry.kind) || entry.size > CACHE_ITEM_MAX) return;
+          if (ended || downloading || !PREVIEWABLE.has(entry.kind) || entry.size > CACHE_ITEM_MAX) return;
           requestFile(entry.path, "preview", "idle").catch(() => {});
         }, HOVER_PREFETCH_MS);
       });
@@ -928,7 +1243,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
           if (mine !== token) return;
           // Optimistically warm the neighbors so ←/→ feel instant.
           for (const near of [list[index + 1], list[index - 1]]) {
-            if (near && PREVIEWABLE.has(near.kind) && near.size <= CACHE_ITEM_MAX) {
+            if (!downloading && near && PREVIEWABLE.has(near.kind) && near.size <= CACHE_ITEM_MAX) {
               requestFile(near.path, "preview", "idle").catch(() => {});
             }
           }
@@ -945,6 +1260,13 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
   }
 }
 
+// Strip path separators and control bytes from a download filename. Both save
+// paths rely on it: a synthetic <a download> must not be steered to a path, and
+// showSaveFilePicker rejects a suggestedName with a separator (a TypeError, not
+// an AbortError). The control-char range is intentional.
+// eslint-disable-next-line no-control-regex
+const safeName = (name: string): string => name.replace(/[/\\\x00-\x1f]/g, "_");
+
 // Trigger a browser download of `blob` without ever exposing it as a navigable
 // resource: a synthetic <a download> click is the only cross-browser way to
 // save a Blob to disk with a chosen filename. The object URL is revoked on a
@@ -952,10 +1274,7 @@ export function mountReceiver(root: HTMLElement, shareId: string, token: string)
 // asynchronously after the click and would abort if the URL vanished first.
 function saveBlob(blob: Blob, name: string): void {
   const url = URL.createObjectURL(blob);
-  // The control-char range is intentional — strip path separators and control
-  // bytes from the download filename.
-  // eslint-disable-next-line no-control-regex
-  const anchor = el("a", { href: url, download: name.replace(/[/\\\x00-\x1f]/g, "_") });
+  const anchor = el("a", { href: url, download: safeName(name) });
   document.body.append(anchor);
   anchor.click();
   anchor.remove();
