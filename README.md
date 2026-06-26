@@ -172,7 +172,7 @@ attacker-supplied content; the relay process.
 | Threat | Vector | Mitigation | Enforced in |
 |---|---|---|---|
 | Token theft / forgery | Hostile receiver lies about its token or forges a request | ~128-bit CSPRNG tokens carried in the URL hash (never sent to the server, so never in its logs); constant-time compare; level re-checked on every request | `src/protocol.ts`, `src/dom.ts` (`safeEqual`), `src/sender.ts` |
-| Poisoned manifest | Hostile sender ships a manifest with traversal, absolute, or NUL paths, bad sizes/kinds, or extra props | `sanitizeManifest` rejects on entry count vs `MAX_MANIFEST_ENTRIES=5000`, path length `1024`, traversal/absolute paths, NUL bytes, sizes, kinds, and attacker props | `src/protocol.ts` (`sanitizeManifest`) |
+| Poisoned manifest | Hostile sender ships a manifest with traversal, absolute, backslash, or control-byte paths, bad sizes/kinds, or extra props | `sanitizeManifest` rejects on entry count vs `MAX_MANIFEST_ENTRIES=5000`, path length `1024`, traversal/absolute/backslash paths, control bytes, sizes, kinds, and attacker props — so a receiver that streams the manifest into a zip can't be zip-slipped | `src/protocol.ts` (`sanitizeManifest`) |
 | Memory exhaustion from a lying sender | Sender declares a `file-head` size larger than the manifest entry | Declared size is clamped to the manifest; a sender that lies is disconnected | `src/protocol.ts` (`validFileHeadSize`), `src/receiver.ts` |
 | Malicious document | Crafted `.docx` or spreadsheet attacks the renderer | Rich previews render in a fully sandboxed (`sandbox=""`) iframe; spreadsheet parsing runs in a Web Worker with a kill-timeout, so a malformed file can hang a worker but not the receiver tab | `src/viewers/docx.ts`, `src/viewers/sheet.worker.ts` |
 | Supply chain on `xlsx` | A vulnerable SheetJS release reaches the renderer | Pinned to a patched SheetJS tarball from `cdn.sheetjs.com` (the last npm release carries known advisories); since the pin is a direct tarball, `npm audit` can't track it — re-check [SheetJS releases](https://cdn.sheetjs.com/) when bumping deps | `package.json` |
@@ -214,20 +214,29 @@ These are accepted risks, not defended boundaries.
   exfiltration.
 - **A malicious signaling server could MITM the SDP handshake.** Self-host the relay
   (~290 lines) if that is in your threat model.
-- **Downloads are memory-bound.** The receiving tab assembles the whole file before
-  saving, so multi-GB files may exhaust its memory.
+- **Downloads stream to disk where the browser allows it.** With the File System
+  Access API (Chromium) a single file — or a whole folder, zipped on the fly —
+  streams straight to disk, so its size isn't bounded by the tab's memory, and the
+  sender paces itself to the receiver's disk (credit-based flow control) so the
+  in-flight bytes stay bounded too. The streamed folder zip is ZIP64, so a single
+  file and the whole archive can each exceed 4 GiB. Browsers without the API
+  (Firefox, Safari) fall back to assembling the download in memory before saving,
+  which a multi-GB selection can exhaust.
 - **A link confers its powers on anyone holding it** until the share is destroyed.
 
 ## How it's verified
 
 The guarantees above are about adversarial behavior, so the suite attacks the code
-rather than trusting it — **68 checks** across four layers. `npm run check` runs the
+rather than trusting it — **88 checks** across four layers. `npm run check` runs the
 first two; `npm run test:headers` and `npm run test:e2e` (which need a build) run the
 rest.
 
-- **Unit (27)** — the pure decision logic in isolation: manifest sanitization (the
-  `1024`/`5000` boundaries, attacker props), the permission truth table, the
-  file-head clamp, the token alphabet and constant-time compare. [test/](test)
+- **Unit (42)** — the pure decision logic in isolation: manifest sanitization (the
+  `1024`/`5000` boundaries, attacker props, backslash/control-byte paths), the
+  permission truth table, the file-head clamp, the download flow-control gate, the
+  token alphabet and constant-time compare, and the store-only zip writer (CRC-32
+  vectors, central-directory offsets, and streamed multi-entry/empty/ZIP64
+  archives). [test/](test)
 - **Signaling smoke (18)** — spawns a real relay and drives the protocol, then the
   abuse defenses: the 33rd peer is refused, an oversized/malformed frame is dropped
   without crashing, a forged peer→peer target still lands on the host only, a
@@ -235,7 +244,7 @@ rest.
 - **HTTP headers (12)** — boots the static server and `curl`s it: CSP and security
   headers present, an encoded `../` is `403`, a malformed `%`-encoding is `400` not a
   crash, the SPA fallback works. [scripts/smoke-headers.mjs](scripts/smoke-headers.mjs)
-- **Two-tab end-to-end (11)** — two real headless-Chrome tabs over a real WebRTC data
+- **Two-tab end-to-end (16)** — two real headless-Chrome tabs over a real WebRTC data
   channel. This is the proof the words above are true; the actual run:
 
 ```text
@@ -244,6 +253,11 @@ ok: sender staged files and minted three permission links
 ok: receiver connected over WebRTC and received the manifest (download link)
 ok: receiver previewed hello.txt — file bytes transferred over the data channel
 ok: download link exposes a Download control
+ok: download-all streamed the whole folder to disk as a valid zip (3 files, content intact)
+ok: download streamed a single file straight to disk (no zip wrapper, bytes intact)
+ok: in-memory fallback (no File System Access API) bundled the folder into a zip
+ok: a file larger than the flow-control window streamed to a slow sink without stalling
+ok: a failed disk write surfaced an error instead of wedging the receiver
 ok: receiver connected over WebRTC (view link)
 ok: view link locks the non-previewable file (secret.bin)
 ok: view link previews but offers no Download control (preview-only enforced)
@@ -251,7 +265,7 @@ ok: spreadsheet (data.csv) parsed in a Web Worker and rendered
 ok: manage link destroyed the share — connected peers were notified
 ok: sender honored the remote destroy and ended the share
 ok: receiver disconnected a sender that lied about a file's declared size
-all e2e smoke tests passed (11 checks)
+all e2e smoke tests passed (16 checks)
 ```
 
 The last line is `validFileHeadSize` doing its job against a scripted malicious
@@ -356,13 +370,14 @@ src/receiver.ts               join, browse, preview, download
 src/rtc.ts                    WebRTC plumbing + backpressure
 src/signaling.ts              reconnecting WS client
 src/manifest.ts               file classification + folder tree
+src/zip.ts                    store-only zip writer (folder downloads)
 src/dom.ts, src/icons.ts      DOM helpers, token crypto (randomId/safeEqual), icons
 src/viewers/*                 per-format preview renderers (sheets parse in a worker)
 src/fx/*                      starfield + WebGL black-hole backdrops
 configure + Makefile.in       parameter capture + ops targets (POSIX)
 deploy/provision.sh           one-shot VPS bootstrap, streamed over ssh
 scripts/*.mjs                 dev runner, font fetch, smoke suites (signaling, headers, e2e)
-test/*.test.ts                unit suites — protocol, manifest, dom
+test/*.test.ts                unit suites — protocol, manifest, dom, zip
 ```
 
 ## License
