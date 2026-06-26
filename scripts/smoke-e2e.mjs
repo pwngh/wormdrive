@@ -149,6 +149,201 @@ try {
   ok("download link exposes a Download control");
   await recv.close();
 
+  // ---- download: the toolbar streams the folder/file straight to disk ----
+  const dl = await browser.newPage();
+  await dl.goto(links.download, { waitUntil: "domcontentloaded" });
+  await dl.waitForFunction(hasRow, { timeout: 20000 }, "hello.txt");
+  // Mock the File System Access API so the stream lands in memory we can inspect.
+  // This drives the REAL streaming path: transfer sink → ZipStream → writable,
+  // i.e. bytes never buffer into a Blob (the multi-gigabyte-safe path).
+  await dl.evaluate(() => {
+    window.__saved = { chunks: [], closed: false };
+    window.showSaveFilePicker = () =>
+      Promise.resolve({
+        createWritable: () =>
+          Promise.resolve({
+            write: (chunk) => {
+              window.__saved.chunks.push([...new Uint8Array(chunk)]);
+              return Promise.resolve();
+            },
+            close: () => {
+              window.__saved.closed = true;
+              return Promise.resolve();
+            },
+            abort: () => Promise.resolve(),
+          }),
+      });
+  });
+  // The toolbar's "Download all" button is distinct from a preview's "Download".
+  await dl.waitForFunction(
+    () => [...document.querySelectorAll(".toolbar button")].some((b) => b.textContent.includes("Download all")),
+    { timeout: 20000 },
+  );
+  await dl.evaluate(() => {
+    [...document.querySelectorAll(".toolbar button")].find((b) => b.textContent.includes("Download all")).click();
+  });
+  await dl.waitForFunction(() => window.__saved.closed && window.__saved.chunks.length > 0, { timeout: 20000 });
+  const zip = Buffer.from((await dl.evaluate(() => window.__saved.chunks.flat())));
+  if (zip.readUInt32LE(0) !== 0x04034b50) throw new Error("download-all: not a zip (bad local file header)");
+  const eocd = zip.length - 22;
+  if (zip.readUInt32LE(eocd) !== 0x06054b50) throw new Error("download-all: missing end-of-central-directory record");
+  const entries = zip.readUInt16LE(eocd + 10);
+  if (entries !== 3) throw new Error(`download-all: expected 3 zip entries, got ${entries}`);
+  const zipText = zip.toString("latin1");
+  for (const name of ["hello.txt", "secret.bin", "data.csv"]) {
+    if (!zipText.includes(name)) throw new Error(`download-all: zip is missing ${name}`);
+  }
+  // The streamed bytes are intact: hello.txt's data follows its local-header name.
+  const dataAt = zipText.indexOf("hello.txt") + "hello.txt".length;
+  if (zip.toString("utf8", dataAt, dataAt + TEXT.length) !== TEXT)
+    throw new Error("download-all: hello.txt content is corrupted inside the zip");
+  ok("download-all streamed the whole folder to disk as a valid zip (3 files, content intact)");
+
+  // A single file streams straight to disk with no zip wrapper. Filter to one
+  // file so the button collapses to a single direct download.
+  await dl.evaluate(() => {
+    window.__saved = { chunks: [], closed: false };
+    const input = document.querySelector(".searchwrap input") || document.querySelector(".toolbar input");
+    input.value = "data.csv";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await dl.waitForFunction(
+    () => [...document.querySelectorAll(".toolbar button")].some((b) => b.textContent.includes("Download data.csv")),
+    { timeout: 20000 },
+  );
+  await dl.evaluate(() => {
+    [...document.querySelectorAll(".toolbar button")].find((b) => b.textContent.includes("Download data.csv")).click();
+  });
+  await dl.waitForFunction(() => window.__saved.closed && window.__saved.chunks.length > 0, { timeout: 20000 });
+  const csv = Buffer.from((await dl.evaluate(() => window.__saved.chunks.flat()))).toString("utf8");
+  if (csv !== "name,score\nalice,10\nbob,20\n") throw new Error(`single-file stream corrupted: ${JSON.stringify(csv)}`);
+  ok("download streamed a single file straight to disk (no zip wrapper, bytes intact)");
+
+  // The in-memory fallback (browsers without the File System Access API): clear
+  // the filter, hide showSaveFilePicker so runDownload takes the bundleInMemory +
+  // saveBlob path, and capture the Blob the synthetic <a download> would save.
+  await dl.evaluate(() => {
+    const input = document.querySelector(".searchwrap input") || document.querySelector(".toolbar input");
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    window.showSaveFilePicker = undefined;
+    window.__mem = { bytes: null };
+    URL.createObjectURL = (blob) => {
+      void blob.arrayBuffer().then((ab) => {
+        window.__mem.bytes = [...new Uint8Array(ab)];
+      });
+      return "blob:captured";
+    };
+    HTMLAnchorElement.prototype.click = function () {}; // don't actually navigate
+  });
+  await dl.waitForFunction(
+    () => [...document.querySelectorAll(".toolbar button")].some((b) => b.textContent.includes("Download all")),
+    { timeout: 20000 },
+  );
+  await dl.evaluate(() => {
+    [...document.querySelectorAll(".toolbar button")].find((b) => b.textContent.includes("Download all")).click();
+  });
+  await dl.waitForFunction(() => window.__mem.bytes && window.__mem.bytes.length > 0, { timeout: 20000 });
+  const memZip = Buffer.from((await dl.evaluate(() => window.__mem.bytes)));
+  if (memZip.readUInt32LE(0) !== 0x04034b50) throw new Error("fallback: not a zip (bad local file header)");
+  const memEntries = memZip.readUInt16LE(memZip.length - 22 + 10);
+  if (memEntries !== 3) throw new Error(`fallback: expected 3 zip entries, got ${memEntries}`);
+  ok("in-memory fallback (no File System Access API) bundled the folder into a zip");
+  await dl.close();
+
+  // ---- flow control: a file larger than the credit window streams to a slow disk ----
+  // A separate one-file share (so the counts above stay put). The file is bigger
+  // than FLOW_WINDOW (8 MiB), and the mock disk write deliberately lags the network,
+  // so the sender's credit gate must actually engage — and the transfer must still
+  // finish, with every byte delivered. This is the case the tiny fixtures can't
+  // reach: a real ack crossing the wire, the window filling, and no deadlock.
+  const BIG = 9 * 1024 * 1024;
+  writeFileSync(join(fixtures, "big.bin"), Buffer.alloc(BIG));
+  const bigSender = await browser.newPage();
+  await bigSender.goto(ORIGIN, { waitUntil: "domcontentloaded" });
+  const bigInput = await bigSender.waitForSelector("input[type=file][multiple]", { timeout: 10000 });
+  await bigInput.uploadFile(join(fixtures, "big.bin"));
+  await bigSender.waitForFunction(() => {
+    const b = [...document.querySelectorAll("button")].find((x) => x.textContent.trim() === "Open share");
+    return b && !b.disabled;
+  }, { timeout: 10000 });
+  await bigSender.evaluate(() => {
+    [...document.querySelectorAll("button")].find((x) => x.textContent.trim() === "Open share").click();
+  });
+  await bigSender.waitForSelector(".ticket-download code.link", { timeout: 10000 });
+  const bigLink = await bigSender.evaluate(() => document.querySelector(".ticket-download code.link").textContent);
+
+  const bigRecv = await browser.newPage();
+  await bigRecv.goto(bigLink, { waitUntil: "domcontentloaded" });
+  await bigRecv.waitForFunction(hasRow, { timeout: 20000 }, "big.bin");
+  await bigRecv.evaluate(() => {
+    window.__big = { bytes: 0, closed: false };
+    window.showSaveFilePicker = () =>
+      Promise.resolve({
+        createWritable: () =>
+          Promise.resolve({
+            // Lag each write ~3 ms so acks trail the network and the window engages.
+            write: (chunk) =>
+              new Promise((r) => setTimeout(() => {
+                window.__big.bytes += chunk.byteLength;
+                r();
+              }, 3)),
+            close: () => {
+              window.__big.closed = true;
+              return Promise.resolve();
+            },
+            abort: () => Promise.resolve(),
+          }),
+      });
+  });
+  await bigRecv.waitForFunction(
+    () => [...document.querySelectorAll(".toolbar button")].some((b) => b.textContent.includes("Download")),
+    { timeout: 20000 },
+  );
+  await bigRecv.evaluate(() => {
+    [...document.querySelectorAll(".toolbar button")].find((b) => b.textContent.includes("Download")).click();
+  });
+  await bigRecv.waitForFunction(() => window.__big.closed, { timeout: 60000 });
+  const streamed = await bigRecv.evaluate(() => window.__big.bytes);
+  if (streamed !== BIG) throw new Error(`flow control: streamed ${streamed} of ${BIG} bytes`);
+  ok("a file larger than the flow-control window streamed to a slow sink without stalling");
+  await bigRecv.close();
+  await bigSender.close();
+
+  // ---- flow control: a failed disk write surfaces an error instead of wedging ----
+  // A writable whose write() rejects (quota, device removed). The receiver must
+  // surface the failure and recover, not freeze its acks and hang the transfer
+  // engine forever — the case the slow-but-succeeding sink above can't reach.
+  const failRecv = await browser.newPage();
+  await failRecv.goto(links.download, { waitUntil: "domcontentloaded" });
+  await failRecv.waitForFunction(hasRow, { timeout: 20000 }, "data.csv");
+  await failRecv.evaluate(() => {
+    window.showSaveFilePicker = () =>
+      Promise.resolve({
+        createWritable: () =>
+          Promise.resolve({
+            write: () => Promise.reject(new Error("mock disk full")),
+            close: () => Promise.resolve(),
+            abort: () => Promise.resolve(),
+          }),
+      });
+    const input = document.querySelector(".searchwrap input") || document.querySelector(".toolbar input");
+    input.value = "data.csv"; // collapse to a single direct stream
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await failRecv.waitForFunction(
+    () => [...document.querySelectorAll(".toolbar button")].some((b) => b.textContent.includes("Download data.csv")),
+    { timeout: 20000 },
+  );
+  await failRecv.evaluate(() => {
+    [...document.querySelectorAll(".toolbar button")].find((b) => b.textContent.includes("Download data.csv")).click();
+  });
+  // Liveness: with the write rejection surfaced, "Download failed" shows within a
+  // beat; without the fix the engine wedges and this times out.
+  await failRecv.waitForFunction(() => document.body.textContent.includes("Download failed"), { timeout: 15000 });
+  ok("a failed disk write surfaced an error instead of wedging the receiver");
+  await failRecv.close();
+
   // ---- receiver (view link): preview-only gating ----
   const viewer = await browser.newPage();
   await viewer.goto(links.view, { waitUntil: "domcontentloaded" });
