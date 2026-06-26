@@ -278,16 +278,22 @@ try {
   await bigRecv.waitForFunction(hasRow, { timeout: 20000 }, "big.bin");
   await bigRecv.evaluate(() => {
     window.__big = { bytes: 0, closed: false };
+    let sinceLag = 0;
     window.showSaveFilePicker = () =>
       Promise.resolve({
         createWritable: () =>
           Promise.resolve({
-            // Lag each write ~3 ms so acks trail the network and the window engages.
-            write: (chunk) =>
-              new Promise((r) => setTimeout(() => {
-                window.__big.bytes += chunk.byteLength;
-                r();
-              }, 3)),
+            // Lag once per ~MiB, not per 64 KiB chunk, so the receiver trails the
+            // network and the credit window engages — but with few enough timers
+            // (~9 for 9 MiB) that background-tab setTimeout throttling (which clamps
+            // to ~1 s each) can't stretch the run to minutes. A per-chunk delay did.
+            write: (chunk) => {
+              window.__big.bytes += chunk.byteLength;
+              sinceLag += chunk.byteLength;
+              if (sinceLag < 1024 * 1024) return Promise.resolve();
+              sinceLag = 0;
+              return new Promise((r) => setTimeout(r, 25));
+            },
             close: () => {
               window.__big.closed = true;
               return Promise.resolve();
